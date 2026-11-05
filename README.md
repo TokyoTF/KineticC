@@ -1,5 +1,5 @@
 <p align="center">
-    <img src="assets/README/kineticc-banner.png" alt="KineticC — Fork of ferrumC">
+    <img src="assets/README/kineticc-bannerV2.png" alt="KineticC — Fork of ferrumC">
 </p>
 
 
