@@ -1,8 +1,9 @@
 use bevy_ecs::message::MessageWriter;
-use bevy_ecs::prelude::{DetectChanges, Entity, Has, Query, Res, With};
+use bevy_ecs::prelude::{DetectChanges, Entity, Has, Query, Res, With, Without};
 use bevy_ecs::world::Mut;
 use bevy_math::bounding::{Aabb3d, BoundingVolume};
 use bevy_math::{IVec3, Vec3A};
+use ferrumc_components::item_entity::ItemEntity;
 use ferrumc_core::transform::grounded::OnGround;
 use ferrumc_core::transform::position::Position;
 use ferrumc_core::transform::velocity::Velocity;
@@ -23,8 +24,12 @@ type CollisionQueryItem<'a> = (
     Mut<'a, OnGround>,
 );
 
+/// Item entities are excluded: `tick_item_entities` integrates their whole movement (gravity,
+/// drag, surface collision) itself, like vanilla `ItemEntity.tick`. Running this generic
+/// collision pass on them too zeroed their velocity and nudged their position mid-fall, which
+/// made dropped stacks jitter and bounce erratically instead of falling smoothly.
 pub fn handle(
-    query: Query<CollisionQueryItem, With<HasCollisions>>,
+    query: Query<CollisionQueryItem, (With<HasCollisions>, Without<ItemEntity>)>,
     mut writer: MessageWriter<SendEntityUpdate>,
     state: Res<GlobalStateResource>,
     registry: Res<PhysicalRegistry>,

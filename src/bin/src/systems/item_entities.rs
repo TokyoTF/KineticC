@@ -533,13 +533,13 @@ fn remove_despawned(
 
 /// Advances an item one tick of its fall, returning whether it came to rest.
 ///
-/// `surface_of` is the height the item would land on from a position, read from the world. It is
-/// passed in rather than read here so the resting rule can be tested without a world: the surface
-/// is the only part of the fall that needs one.
+/// `surface_of` is the height the item would land on between two positions, read from the world.
+/// It is passed in rather than read here so the resting rule can be tested without a world: the
+/// surface is the only part of the fall that needs one.
 fn fall_step(
     position: &mut Position,
     velocity: &mut Velocity,
-    surface_of: impl Fn(DVec3) -> f64,
+    surface_of: impl Fn(DVec3, DVec3) -> f64,
     in_fluid: bool,
 ) -> bool {
     if in_fluid {
@@ -551,10 +551,14 @@ fn fall_step(
     }
 
     let next = position.coords + velocity.vec.as_dvec3();
-    let surface = surface_of(next);
+    // Swept check: the highest solid surface between where the item is and where it is heading.
+    // At terminal velocity a step is more than one block tall, so checking only the block under
+    // the landing point would let the item tunnel through thin floors and then pop back up.
+    let surface = surface_of(position.coords, next);
 
     if velocity.vec.y <= 0.0 && next.y <= surface && !in_fluid {
-        position.coords.y = surface;
+        // Land on the surface but keep the horizontal motion: vanilla items slide to a stop.
+        position.coords = DVec3::new(next.x, surface, next.z);
         velocity.vec.y = 0.0;
         return true;
     }
@@ -572,7 +576,7 @@ fn apply_movement(
     grounded: &mut OnGround,
     in_fluid: bool,
 ) {
-    let surface_of = |next: DVec3| surface_height(state, next, dimension.as_str(), in_fluid);
+    let surface_of = |from: DVec3, to: DVec3| surface_height(state, from, to, dimension.as_str(), in_fluid);
 
     if fall_step(position, velocity, surface_of, in_fluid) {
         // Resting sheds most of the sideways drift, the way hitting the ground slows an item down.
@@ -584,15 +588,18 @@ fn apply_movement(
     }
 }
 
-/// The height an item comes to rest on: the top of the first solid block below the position.
+/// The height an item comes to rest on: the top of the highest solid block in the column between
+/// `from` and `to`, so a fast fall is stopped by the first surface it crosses instead of sinking
+/// past it.
 ///
-/// The top of the block below, not the item's own floored height. It has to be the block's top
-/// because the caller compares it against where the item is about to be: returning the item's
-/// floored height would only ever stop it on an exact block boundary, which a falling item almost
-/// never lands on, so it would sink through the world instead of resting on it.
+/// The top of the block, not the item's own floored height. It has to be the block's top because
+/// the caller compares it against where the item is about to be: returning the item's floored
+/// height would only ever stop it on an exact block boundary, which a falling item almost never
+/// lands on, so it would sink through the world instead of resting on it.
 fn surface_height(
     state: &GlobalStateResource,
-    position: DVec3,
+    from: DVec3,
+    to: DVec3,
     dimension: &str,
     in_fluid: bool,
 ) -> f64 {
@@ -600,14 +607,20 @@ fn surface_height(
         return f64::from(MIN_WORLD_Y);
     }
 
-    // The block directly under the item: far enough below its feet that an item already resting
-    // on a block still sees that block, rather than the air it stands in.
-    let below_y = (position.y - REST_OFFSET).floor();
-    let below = block_at(state, (position.x, below_y, position.z), dimension);
-    match below {
-        Some(block) if is_solid(&block) => below_y + 1.0,
-        _ => f64::from(MIN_WORLD_Y),
+    // Scan from just under the item's feet (far enough down that an item already resting on a
+    // block still sees that block, rather than the air it stands in) down to the landing cell.
+    let top_y = (from.y - REST_OFFSET).floor();
+    let bottom_y = (to.y - REST_OFFSET).floor();
+    let mut y = top_y;
+    while y >= bottom_y {
+        if let Some(block) = block_at(state, (to.x, y, to.z), dimension) {
+            if is_solid(&block) {
+                return y + 1.0;
+            }
+        }
+        y -= 1.0;
     }
+    f64::from(MIN_WORLD_Y)
 }
 
 /// The block at a world-space position, or `None` when it cannot be read.
@@ -722,7 +735,7 @@ mod tests {
         let mut position = Position::new(0.5, surface + 0.25, 0.5);
         let mut velocity = Velocity::new(0.0, 0.2, 0.0);
         for _ in 0..100 {
-            if fall_step(&mut position, &mut velocity, |_| surface, false) {
+            if fall_step(&mut position, &mut velocity, |_from, _to| surface, false) {
                 return position;
             }
         }
@@ -748,13 +761,35 @@ mod tests {
         let mut velocity = Velocity::zero();
 
         for tick in 0..20 {
-            let still_resting = fall_step(&mut resting, &mut velocity, |_| 64.0, false);
+            let still_resting = fall_step(&mut resting, &mut velocity, |_from, _to| 64.0, false);
             assert!(
                 still_resting,
                 "the item must keep resting on the surface, not drift down (tick {tick})"
             );
             assert_eq!(resting.coords.y, 64.0, "the item sank on tick {tick}");
         }
+    }
+
+    #[test]
+    fn a_fast_fall_is_stopped_by_a_surface_it_crosses_mid_step() {
+        // Terminal-velocity step: from y = 70 with velocity -10 the landing point y ~ 60 is
+        // already below the surface at 64. The swept scan must still report that surface
+        // instead of only looking at the landing cell, or the item tunnels through the floor.
+        let mut position = Position::new(0.5, 70.0, 0.5);
+        let mut velocity = Velocity::new(0.0, -10.0, 0.0);
+        let surface_of = |from: DVec3, to: DVec3| {
+            if to.y <= 64.0 && from.y >= 64.0 {
+                64.0
+            } else {
+                f64::from(MIN_WORLD_Y)
+            }
+        };
+
+        let resting = fall_step(&mut position, &mut velocity, surface_of, false);
+
+        assert!(resting, "the item must land on the surface it crossed");
+        assert_eq!(position.coords.y, 64.0);
+        assert_eq!(velocity.vec.y, 0.0);
     }
 
     #[test]

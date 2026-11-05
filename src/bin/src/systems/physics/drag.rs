@@ -1,5 +1,6 @@
-use bevy_ecs::prelude::{Query, Res, With};
+use bevy_ecs::prelude::{Query, Res, With, Without};
 use bevy_math::{IVec3, Vec3A};
+use ferrumc_components::item_entity::ItemEntity;
 use ferrumc_core::transform::position::Position;
 use ferrumc_core::transform::velocity::Velocity;
 use ferrumc_entities::components::{Baby, EntityMetadata, PhysicalRegistry};
@@ -9,11 +10,23 @@ use ferrumc_state::GlobalStateResource;
 use ferrumc_world::block_state_id::BlockStateId;
 use ferrumc_world::pos::{ChunkBlockPos, ChunkPos};
 
+/// Item entities are excluded: `tick_item_entities` already applies the item's own fluid drag
+/// and buoyancy (`FLUID_DRAG` / `FLUID_LIFT`, vanilla `ItemEntity` values), so running this on
+/// them too doubled the effect and made items bob erratically in water.
+type DragQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut Velocity,
+        &'static Position,
+        &'static EntityMetadata,
+        Option<&'static Baby>,
+    ),
+    (With<HasWaterDrag>, Without<ItemEntity>),
+>;
+
 pub fn handle(
-    mut query: Query<
-        (&mut Velocity, &Position, &EntityMetadata, Option<&Baby>),
-        With<HasWaterDrag>,
-    >,
+    mut query: DragQuery,
     state: Res<GlobalStateResource>,
     registry: Res<PhysicalRegistry>,
 ) {
