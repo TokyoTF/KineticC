@@ -12,6 +12,12 @@ pub struct ClickContainer {
     pub button: i8,
     pub mode: VarInt,
     pub changed_slots: LengthPrefixedVec<ChangedSlot>,
+    /// The stack left on the cursor after the click.
+    ///
+    /// This is a `HashedStack`, not a full slot: only the item, the count and hashes of the
+    /// component patch travel. The server needs the item and the count to drop what a click outside
+    /// the window is carrying.
+    pub carried_item: PrefixedOptional<HashedItem>,
 }
 
 #[derive(NetDecode)]

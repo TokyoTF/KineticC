@@ -2,7 +2,7 @@ use bevy_ecs::prelude::{MessageReader, Query};
 use bevy_math::IVec2;
 use ferrumc_components::player::client_information::ClientInformationComponent;
 use ferrumc_config::server_config::get_global_config;
-use ferrumc_core::chunks::chunk_receiver::{effective_view_radius, ChunkReceiver};
+use ferrumc_core::chunks::chunk_receiver::{ChunkReceiver, effective_view_radius};
 use ferrumc_core::transform::position::Position;
 use ferrumc_messages::chunk_calc::ChunkCalc;
 use ferrumc_world::pos::ChunkPos;

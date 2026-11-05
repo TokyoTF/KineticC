@@ -12,5 +12,9 @@ ferrumc-inventories = { workspace = true }
 ferrumc-core = { workspace = true }
 ferrumc-net-codec = { workspace = true }
 ferrumc-config = { workspace = true }
+ferrumc-world = { workspace = true }
 bitcode = { workspace = true }
 bitcode_derive = { workspace = true }
+
+[lints]
+workspace = true

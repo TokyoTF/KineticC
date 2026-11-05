@@ -1,6 +1,8 @@
 pub mod abilities;
 pub mod client_information;
 pub mod experience;
+pub mod fall_flying;
+pub mod fall_tracker;
 pub mod gamemode;
 pub mod gameplay_state;
 pub mod hunger;

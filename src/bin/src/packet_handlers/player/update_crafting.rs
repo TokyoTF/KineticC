@@ -41,6 +41,42 @@ pub fn update_player_crafting_grid(inventory: &mut Inventory, eid: Entity) {
     }
 }
 
+/// Spends one unit of every item in the 2x2 crafting grid.
+///
+/// Called after the player has taken the crafted result: the client reports the output slot as empty
+/// but leaves the ingredients in place, because in vanilla the server consumes them.
+pub fn consume_crafting_ingredients(inventory: &mut Inventory, eid: Entity) {
+    for slot in [
+        defined_slots::player::CRAFT_SLOT_1,
+        defined_slots::player::CRAFT_SLOT_2,
+        defined_slots::player::CRAFT_SLOT_3,
+        defined_slots::player::CRAFT_SLOT_4,
+    ] {
+        let Some(current) = inventory.get_item(slot as usize).ok().flatten().cloned() else {
+            continue;
+        };
+
+        let remaining = current.count.0 - 1;
+        if remaining <= 0 {
+            if let Err(err) = inventory.clear_slot_with_update(slot as usize, eid) {
+                error!("Failed to clear crafting slot {slot}: {}", err);
+            }
+        } else if let Err(err) = inventory.set_item_with_update(
+            slot as usize,
+            InventorySlot {
+                count: VarInt(remaining),
+                ..current
+            },
+            eid,
+        ) {
+            error!("Failed to spend crafting slot {slot}: {}", err);
+        }
+    }
+
+    // The grid changed, so the result slot has to be recomputed.
+    update_player_crafting_grid(inventory, eid);
+}
+
 fn get_inventory_slot(inventory: &Inventory, slot: u8) -> Option<&Item> {
     inventory
         .get_item(slot as usize)

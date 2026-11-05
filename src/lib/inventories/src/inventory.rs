@@ -1,9 +1,14 @@
+use crate::defined_slots;
 use crate::errors::InventoryError;
 use crate::item::ItemID;
 use crate::slot::InventorySlot;
 use crate::{INVENTORY_UPDATES_QUEUE, InventoryUpdate};
 use bevy_ecs::prelude::{Component, Entity};
 use bitcode_derive::{Decode, Encode};
+use ferrumc_net_codec::net_types::var_int::VarInt;
+
+/// The most items a single stack can hold.
+pub const MAX_STACK_SIZE: u32 = 64;
 
 #[derive(Component, Clone, Debug, Decode, Encode)]
 pub struct Inventory {
@@ -77,6 +82,100 @@ impl Inventory {
         Err(InventoryError::InventoryFull)
     }
 
+    /// Adds a picked up item to the inventory the way vanilla does.
+    ///
+    /// The stack is merged into a stack of the same item when one has room for it, and whatever
+    /// is left goes into the hotbar before the rest of the inventory. The crafting grid, the
+    /// armour and the offhand slot are never used for this.
+    ///
+    /// `selected_slot` is the inventory index of the hotbar slot the player has selected, which
+    /// vanilla tries first.
+    pub fn pick_up_with_update(
+        &mut self,
+        item: InventorySlot,
+        entity: Entity,
+        selected_slot: Option<usize>,
+    ) -> Result<(), InventoryError> {
+        let Some(item_id) = item.item_id else {
+            return Err(InventoryError::ItemNotFound);
+        };
+
+        let mut remaining = item.count.0.max(0) as u32;
+        if remaining == 0 {
+            return Ok(());
+        }
+
+        // The order vanilla looks for room in: the slot the player has selected, the rest of the
+        // hotbar and then the rest of the inventory.
+        let mut order: Vec<usize> = Vec::with_capacity(36);
+        if let Some(slot) = selected_slot {
+            order.push(slot);
+        }
+        order.extend(
+            defined_slots::player::HOTBAR_SLOT_1 as usize
+                ..=defined_slots::player::HOTBAR_SLOT_9 as usize,
+        );
+        order.extend(9..defined_slots::player::HOTBAR_SLOT_1 as usize);
+
+        // Merge into a stack of the same item that still has room.
+        for index in order.iter().copied() {
+            if remaining == 0 {
+                break;
+            }
+
+            let Some(slot) = self.slots.get_mut(index).and_then(Option::as_mut) else {
+                continue;
+            };
+
+            if slot.item_id != Some(item_id) {
+                continue;
+            }
+
+            let room = MAX_STACK_SIZE.saturating_sub(slot.count.0.max(0) as u32);
+            if room == 0 {
+                continue;
+            }
+
+            let added = room.min(remaining);
+            slot.count = VarInt::new(slot.count.0 + added as i32);
+            remaining -= added;
+
+            INVENTORY_UPDATES_QUEUE.push(InventoryUpdate {
+                slot_index: index as u8,
+                slot: slot.clone(),
+                entity,
+            });
+        }
+
+        // Whatever is left goes into the first free slot.
+        for index in order.iter().copied() {
+            if remaining == 0 {
+                break;
+            }
+
+            if self.slots.get(index).is_some_and(Option::is_some) {
+                continue;
+            }
+
+            let mut stack = item.clone();
+            stack.count = VarInt::new(remaining as i32);
+            self.slots[index] = Some(stack.clone());
+            remaining = 0;
+
+            INVENTORY_UPDATES_QUEUE.push(InventoryUpdate {
+                slot_index: index as u8,
+                slot: stack,
+                entity,
+            });
+        }
+
+        if remaining > 0 {
+            return Err(InventoryError::InventoryFull);
+        }
+
+        Ok(())
+    }
+
     pub fn set_item(&mut self, index: usize, item: InventorySlot) -> Result<(), InventoryError> {
         if index >= self.slots.len() {
             return Err(InventoryError::InvalidSlotIndex(index));
@@ -98,6 +197,27 @@ impl Inventory {
         INVENTORY_UPDATES_QUEUE.push(InventoryUpdate {
             slot_index: index as u8,
             slot: item,
+            entity,
+        });
+        Ok(())
+    }
+
+    /// Replaces a slot with the given content, or clears it when `item` is `None`, and sends an
+    /// update. Clearing through this method keeps the server state and the client in step for slots
+    /// a click emptied.
+    pub fn set_slot_with_update(
+        &mut self,
+        index: usize,
+        item: Option<InventorySlot>,
+        entity: Entity,
+    ) -> Result<(), InventoryError> {
+        if index >= self.slots.len() {
+            return Err(InventoryError::InvalidSlotIndex(index));
+        }
+        self.slots[index] = item.clone();
+        INVENTORY_UPDATES_QUEUE.push(InventoryUpdate {
+            slot_index: index as u8,
+            slot: item.unwrap_or_default(),
             entity,
         });
         Ok(())
@@ -238,6 +358,74 @@ mod tests {
         let inv = Inventory::new(5);
         assert_eq!(inv.slots.len(), 5);
         assert!(inv.slots.iter().all(|s| s.is_none()));
+    }
+
+    #[test]
+    fn a_picked_up_item_goes_into_the_hotbar() {
+        let mut inv = Inventory::default();
+
+        let mut slot = make_slot_with_id(1);
+        slot.count = VarInt::new(3);
+
+        inv.pick_up_with_update(slot, Entity::from_raw_u32(0).unwrap(), None)
+            .expect("the item fits in the inventory");
+
+        // The hotbar comes before the rest of the inventory, and the crafting grid, the armour
+        // and the offhand slot are never used.
+        assert!(
+            inv.get_item(defined_slots::player::HOTBAR_SLOT_1 as usize)
+                .unwrap()
+                .is_some()
+        );
+        assert!(inv.get_item(0).unwrap().is_none());
+        assert!(inv.get_item(9).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_picked_up_item_goes_into_the_selected_slot_first() {
+        let mut inv = Inventory::default();
+        let selected = defined_slots::player::HOTBAR_SLOT_3 as usize;
+
+        let mut stack = make_slot_with_id(1);
+        stack.count = VarInt::new(1);
+
+        inv.pick_up_with_update(stack, Entity::from_raw_u32(0).unwrap(), Some(selected))
+            .expect("the item fits in the inventory");
+
+        assert!(inv.get_item(selected).unwrap().is_some());
+        assert!(
+            inv.get_item(defined_slots::player::HOTBAR_SLOT_1 as usize)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_picked_up_item_is_merged_into_a_stack_of_the_same_item() {
+        let mut inv = Inventory::default();
+
+        let mut stack = make_slot_with_id(1);
+        stack.count = VarInt::new(60);
+        inv.set_item(defined_slots::player::HOTBAR_SLOT_1 as usize, stack)
+            .unwrap();
+
+        let mut picked_up = make_slot_with_id(1);
+        picked_up.count = VarInt::new(10);
+        inv.pick_up_with_update(picked_up, Entity::from_raw_u32(0).unwrap(), None)
+            .expect("the item fits in the inventory");
+
+        let merged = inv
+            .get_item(defined_slots::player::HOTBAR_SLOT_1 as usize)
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.count.0, 64);
+
+        // The rest does not fit in the full stack and goes into the next free slot.
+        let overflow = inv
+            .get_item(defined_slots::player::HOTBAR_SLOT_2 as usize)
+            .unwrap()
+            .unwrap();
+        assert_eq!(overflow.count.0, 6);
     }
 
     #[test]

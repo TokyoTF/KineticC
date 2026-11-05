@@ -1,3 +1,4 @@
+pub mod carried;
 pub mod crafting;
 pub mod defined_slots;
 pub mod errors;

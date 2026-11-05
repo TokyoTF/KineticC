@@ -18,6 +18,7 @@ mod packet_handlers;
 mod register_messages;
 mod register_resources;
 mod systems;
+mod tests;
 
 #[cfg(feature = "dhat")]
 #[global_allocator]

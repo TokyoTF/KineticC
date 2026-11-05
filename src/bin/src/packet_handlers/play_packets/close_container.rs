@@ -1,16 +1,26 @@
-use bevy_ecs::system::{Query, Res};
+use bevy_ecs::system::{Commands, Query, Res};
+use ferrumc_core::transform::position::Position;
 use ferrumc_inventories::defined_slots;
 use ferrumc_inventories::inventory::Inventory;
+use ferrumc_net::connection::StreamWriter;
 use ferrumc_net::CloseContainerReceiver;
 use tracing::{debug, error};
 
+use crate::systems::chests::{close_chest, OpenChest};
+
 /// Called when a player closes a container.
 ///
-/// For now, all it does is check if that container is the player inventory,
-/// and then clears the player's crafting grid if so.
-pub fn handle(receiver: Res<CloseContainerReceiver>, mut inventories: Query<&mut Inventory>) {
+/// Window `0` is the player's own screen, so closing it clears the 2x2 crafting grid. Any other
+/// window is a chest: the screen is confirmed as closed and the lid lowers for everyone nearby. This
+/// is the only reader of the close packet, so the chest bookkeeping has to live here.
+pub fn handle(
+    mut commands: Commands,
+    receiver: Res<CloseContainerReceiver>,
+    mut inventories: Query<&mut Inventory>,
+    open_chests: Query<&OpenChest>,
+    players: Query<(&StreamWriter, &Position)>,
+) {
     for (event, eid) in receiver.0.try_iter() {
-        // 0 is the player's inventory
         if event.window_id.0 == 0 {
             debug!("Clearing crafting grid");
 
@@ -24,6 +34,16 @@ pub fn handle(receiver: Res<CloseContainerReceiver>, mut inventories: Query<&mut
                         .unwrap_or_else(|err| error!("Failed to clear player inventory: {}", err))
                 }
             }
+            continue;
         }
+
+        let Ok(open) = open_chests.get(eid) else {
+            continue;
+        };
+        let Ok((conn, _)) = players.get(eid) else {
+            continue;
+        };
+        let listeners: Vec<(&StreamWriter, &Position)> = players.iter().collect();
+        close_chest(&mut commands, eid, conn, *open, &listeners);
     }
 }

@@ -5,6 +5,7 @@ use crate::pos::ChunkPos;
 // db_functions.rs
 use crate::World;
 use crate::{warn, MutChunk, RefChunk};
+use dashmap::mapref::entry::Entry;
 use ferrumc_config::server_config::get_global_config;
 use std::hash::Hasher;
 use tracing::trace;
@@ -36,20 +37,20 @@ impl World {
         pos: ChunkPos,
         dimension: &str,
     ) -> Result<RefChunk<'_>, WorldError> {
-        if let Some(chunk) = self.cache.get(&(pos, dimension.to_string())) {
+        let key = (pos, dimension.to_string());
+        if let Some(chunk) = self.cache.get(&key) {
             return Ok(chunk);
         }
-        let chunk = load_chunk_internal(self, pos, dimension);
-        match chunk {
-            Ok(c) => {
-                self.cache.insert((pos, dimension.to_string()), c);
-                Ok(self
-                    .cache
-                    .get(&(pos, dimension.to_string()))
-                    .expect("Chunk was just inserted into the cache"))
-            }
-            Err(e) => Err(e),
-        }
+        let chunk = load_chunk_internal(self, pos, dimension)?;
+
+        // The chunk is put into the cache and looked up in one atomic step. The chunk unloader
+        // runs on the tick thread and removes entries while other threads load chunks, so a
+        // plain insert followed by a lookup can find nothing, which would drop the chunk that
+        // was just loaded and take the whole worker thread down with it.
+        Ok(match self.cache.entry(key) {
+            Entry::Occupied(entry) => entry.into_ref().downgrade(),
+            Entry::Vacant(entry) => entry.insert(chunk).downgrade(),
+        })
     }
 
     /// Load a mutable chunk from the storage backend. If the chunk is in the cache, it will be returned
@@ -60,20 +61,17 @@ impl World {
         pos: ChunkPos,
         dimension: &'_ str,
     ) -> Result<MutChunk<'_>, WorldError> {
-        if let Some(chunk) = self.cache.get_mut(&(pos, dimension.to_string())) {
+        let key = (pos, dimension.to_string());
+        if let Some(chunk) = self.cache.get_mut(&key) {
             return Ok(chunk);
         }
-        let chunk = load_chunk_internal(self, pos, dimension);
-        match chunk {
-            Ok(c) => {
-                self.cache.insert((pos, dimension.to_string()), c);
-                Ok(self
-                    .cache
-                    .get_mut(&(pos, dimension.to_string()))
-                    .expect("Chunk was just inserted into the cache"))
-            }
-            Err(e) => Err(e),
-        }
+        let chunk = load_chunk_internal(self, pos, dimension)?;
+
+        // See `load_chunk` for why the insert and the lookup happen in one atomic step.
+        Ok(match self.cache.entry(key) {
+            Entry::Occupied(entry) => entry.into_ref(),
+            Entry::Vacant(entry) => entry.insert(chunk),
+        })
     }
 
     /// Returns a read guard for a chunk **only if it is already resident in the in-memory cache**,
@@ -169,23 +167,31 @@ impl World {
         &'_ self,
         coords: &'_ [(ChunkPos, &'_ str)],
     ) -> Result<Vec<RefChunk<'_>>, WorldError> {
-        let mut found_chunks = Vec::new();
-        let mut missing_chunks = Vec::new();
-        for coord in coords {
-            if let Some(chunk) = self.cache.get(&(coord.0, coord.1.to_string())) {
-                found_chunks.push(chunk);
-            } else {
-                missing_chunks.push(*coord);
+        // The missing chunks are loaded and put into the cache before any read guard is taken.
+        // The cache is sharded, and writing to a shard while holding a read guard on that same
+        // shard blocks until the guard is dropped, which would never happen.
+        let missing_chunks: Vec<(ChunkPos, &str)> = coords
+            .iter()
+            .filter(|(pos, dimension)| !self.cache.contains_key(&(*pos, dimension.to_string())))
+            .copied()
+            .collect();
+
+        if !missing_chunks.is_empty() {
+            let fetched = load_chunk_batch_internal(self, &missing_chunks)?;
+            for (chunk, (pos, dimension)) in fetched.into_iter().zip(missing_chunks) {
+                self.cache.insert((pos, dimension.to_string()), chunk);
             }
         }
-        let fetched = load_chunk_batch_internal(self, &missing_chunks)?;
-        for (chunk, (pos, dimension)) in fetched.into_iter().zip(missing_chunks) {
-            self.cache.insert((pos, dimension.to_string()), chunk);
-            let found_chunk = self
+
+        let mut found_chunks = Vec::new();
+        for (pos, dimension) in coords {
+            // A chunk that the unloader removes while it is being looked up is reported as
+            // missing, instead of taking the calling thread down.
+            let chunk = self
                 .cache
-                .get(&(pos, dimension.to_string()))
-                .expect("Chunk was just inserted into the cache");
-            found_chunks.push(found_chunk);
+                .get(&(*pos, dimension.to_string()))
+                .ok_or(WorldError::ChunkNotFound)?;
+            found_chunks.push(chunk);
         }
         Ok(found_chunks)
     }
@@ -194,23 +200,27 @@ impl World {
         &'_ self,
         coords: &'_ [(ChunkPos, &'_ str)],
     ) -> Result<Vec<MutChunk<'_>>, WorldError> {
-        let mut found_chunks = Vec::new();
-        let mut missing_chunks = Vec::new();
-        for coord in coords {
-            if let Some(chunk) = self.cache.get_mut(&(coord.0, coord.1.to_string())) {
-                found_chunks.push(chunk);
-            } else {
-                missing_chunks.push(*coord);
+        // See `load_chunk_batch` for why the cache is written to before any guard is taken.
+        let missing_chunks: Vec<(ChunkPos, &str)> = coords
+            .iter()
+            .filter(|(pos, dimension)| !self.cache.contains_key(&(*pos, dimension.to_string())))
+            .copied()
+            .collect();
+
+        if !missing_chunks.is_empty() {
+            let fetched = load_chunk_batch_internal(self, &missing_chunks)?;
+            for (chunk, (pos, dimension)) in fetched.into_iter().zip(missing_chunks) {
+                self.cache.insert((pos, dimension.to_string()), chunk);
             }
         }
-        let fetched = load_chunk_batch_internal(self, &missing_chunks)?;
-        for (chunk, (pos, dimension)) in fetched.into_iter().zip(missing_chunks) {
-            self.cache.insert((pos, dimension.to_string()), chunk);
-            let found_chunk = self
+
+        let mut found_chunks = Vec::new();
+        for (pos, dimension) in coords {
+            let chunk = self
                 .cache
-                .get_mut(&(pos, dimension.to_string()))
-                .expect("Chunk was just inserted into the cache");
-            found_chunks.push(found_chunk);
+                .get_mut(&(*pos, dimension.to_string()))
+                .ok_or(WorldError::ChunkNotFound)?;
+            found_chunks.push(chunk);
         }
         Ok(found_chunks)
     }

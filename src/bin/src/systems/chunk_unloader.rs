@@ -41,7 +41,14 @@ pub fn handle(state: Res<GlobalStateResource>, query: Query<&ChunkReceiver>) {
         all_chunks.insert(k.0);
         // Track chunks that are visible to any connected player
         for chunk_receiver in query.iter() {
-            if chunk_receiver.loaded.contains(&(k.0.x(), k.0.z())) {
+            // A chunk that is still in flight counts as needed: it is being loaded or generated on
+            // a worker thread and the packet is built from the cached copy afterwards. Dropping it
+            // here would lose the chunk (it is not dirty yet, so it is not written back) and the
+            // worker would find nothing in the cache, which made the world regenerate every chunk
+            // on every join and slowed the tick down.
+            if chunk_receiver.loaded.contains(&(k.0.x(), k.0.z()))
+                || chunk_receiver.pending.contains(&(k.0.x(), k.0.z()))
+            {
                 visible_chunks.insert(k.0);
                 continue 'chunk_iter;
             }
@@ -70,15 +77,16 @@ pub fn handle(state: Res<GlobalStateResource>, query: Query<&ChunkReceiver>) {
                 unloaded_entries += 1;
             }
             None => {
-                error!("Chunk at position {:?} could not be removed because it does not exist in the cache.", chunk_pos);
+                error!(
+                    "Chunk at position {:?} could not be removed because it does not exist in the cache.",
+                    chunk_pos
+                );
             }
         }
     }
     let remaining_chunks = state.0.world.get_cache().len();
     trace!(
         "Unloaded {} chunks from cache ({} written to world). {} chunks remain in cache.",
-        unloaded_entries,
-        written_chunks,
-        remaining_chunks
+        unloaded_entries, written_chunks, remaining_chunks
     );
 }

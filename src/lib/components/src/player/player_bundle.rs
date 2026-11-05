@@ -2,9 +2,9 @@ use crate::{
     active_effects::ActiveEffects,
     health::Health,
     player::{
-        abilities::PlayerAbilities, experience::Experience, gamemode::GameModeComponent,
-        gameplay_state::ender_chest::EnderChest, hunger::Hunger, sneak::SneakState,
-        swimming::SwimmingState,
+        abilities::PlayerAbilities, experience::Experience, fall_tracker::FallTracker,
+        gamemode::GameModeComponent, gameplay_state::ender_chest::EnderChest, hunger::Hunger,
+        sneak::SneakState, swimming::SwimmingState,
     },
 };
 use bevy_ecs::prelude::Bundle;
@@ -13,7 +13,7 @@ use ferrumc_core::{
     identity::player_identity::PlayerIdentity,
     transform::{grounded::OnGround, position::Position, rotation::Rotation},
 };
-use ferrumc_inventories::{hotbar::Hotbar, inventory::Inventory};
+use ferrumc_inventories::{carried::CarriedItem, hotbar::Hotbar, inventory::Inventory};
 /// A Bevy Bundle containing all components required for a player entity.
 /// This groups all 17+ components into a single, spawnable unit.
 #[derive(Bundle, Default)]
@@ -34,6 +34,7 @@ pub struct PlayerBundle {
     // Inventory
     pub inventory: Inventory,
     pub hotbar: Hotbar,
+    pub carried_item: CarriedItem,
     pub ender_chest: EnderChest,
 
     // Survival Stats
@@ -45,4 +46,5 @@ pub struct PlayerBundle {
     // Movement State
     pub swimming: SwimmingState,
     pub sneak: SneakState,
+    pub fall_tracker: FallTracker,
 }

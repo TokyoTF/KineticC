@@ -117,18 +117,17 @@ fn setup_compression(conn_write: &StreamWriter, config: &ServerConfig) -> Result
 }
 
 /// Handles encryption setup and optional Mojang authentication.
-/// Returns player properties if authentication was performed.
+/// Returns the verified username, the verified UUID and the profile properties if authentication
+/// was performed.
 async fn setup_encryption_and_auth(
     conn_read: &mut EncryptedReader<OwnedReadHalf>,
     conn_write: &StreamWriter,
     config: &ServerConfig,
     login_start: &LoginStartPacket,
     compressed: bool,
-) -> Result<Vec<PlayerProperty>, NetError> {
-    let mut player_properties = Vec::new();
-
+) -> Result<(String, Uuid, Vec<PlayerProperty>), NetError> {
     if !config.encryption_enabled && !config.online_mode {
-        return Ok(player_properties);
+        return Ok(offline_identity(login_start));
     }
 
     // Generate verify token
@@ -183,30 +182,46 @@ async fn setup_encryption_and_auth(
         let (username, uuid, properties) =
             authenticate_user(&login_start.username, "", &shared_secret).await?;
 
-        if username != login_start.username || uuid.as_u128() != login_start.uuid {
+        // The session server is the authority on the identity of a premium player, and the
+        // profile properties it returns are the ones carrying the player's skin. The name is
+        // compared without case, because the session server resolves names case insensitively.
+        if !username.eq_ignore_ascii_case(&login_start.username) {
             return Err(NetError::AuthenticationError(
                 NetAuthenticationError::InformationDoesntMatch,
             ));
         }
 
-        player_properties.extend_from_slice(&properties);
+        return Ok((username, uuid, properties));
     }
 
-    Ok(player_properties)
+    Ok(offline_identity(login_start))
+}
+
+/// The identity of a player that joined without being authenticated by Mojang.
+///
+/// The name and the UUID are the ones the client sent, and the player carries no profile
+/// properties, so the client draws them with a default skin.
+fn offline_identity(login_start: &LoginStartPacket) -> (String, Uuid, Vec<PlayerProperty>) {
+    (
+        login_start.username.clone(),
+        Uuid::from_u128(login_start.uuid),
+        Vec::new(),
+    )
 }
 
 /// Sends Login Success packet and waits for client acknowledgement.
 async fn send_login_success(
     conn_read: &mut EncryptedReader<OwnedReadHalf>,
     conn_write: &StreamWriter,
-    login_start: &LoginStartPacket,
+    username: &str,
+    uuid: Uuid,
     player_properties: &[PlayerProperty],
     compressed: bool,
 ) -> Result<PlayerIdentity, NetError> {
     // Send Login Success
     let login_success = LoginSuccessPacket {
-        uuid: login_start.uuid,
-        username: &login_start.username,
+        uuid: uuid.as_u128(),
+        username,
         properties: LengthPrefixedVec::new(
             player_properties
                 .iter()
@@ -222,9 +237,9 @@ async fn send_login_success(
 
     // Build PlayerIdentity
     let player_identity = PlayerIdentity {
-        uuid: Uuid::from_u128(login_start.uuid),
-        username: login_start.username.clone(),
-        short_uuid: login_start.uuid as i32,
+        uuid,
+        username: username.to_string(),
+        short_uuid: uuid.as_u128() as i32,
         properties: player_properties.to_vec(),
     };
 
@@ -554,13 +569,14 @@ pub(super) async fn login(
     // Phase 1: Initial Handshake
     let login_start = receive_login_start(conn_read, false).await?;
     let compressed = setup_compression(conn_write, config)?;
-    let player_properties =
+    let (username, uuid, player_properties) =
         setup_encryption_and_auth(conn_read, conn_write, config, &login_start, compressed).await?;
 
     let player_identity = send_login_success(
         conn_read,
         conn_write,
-        &login_start,
+        &username,
+        uuid,
         &player_properties,
         compressed,
     )

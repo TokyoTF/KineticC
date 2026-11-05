@@ -5,7 +5,8 @@ use ferrumc_core::identity::entity_identity::EntityIdentity;
 use ferrumc_core::identity::player_identity::PlayerIdentity;
 use ferrumc_core::transform::position::Position;
 use ferrumc_core::transform::rotation::Rotation;
-use ferrumc_macros::{get_registry_entry, packet, NetEncode};
+use ferrumc_core::transform::velocity::Velocity;
+use ferrumc_macros::{NetEncode, get_registry_entry, packet};
 use ferrumc_net_codec::net_types::angle::NetAngle;
 use ferrumc_net_codec::net_types::var_int::VarInt;
 
@@ -58,6 +59,44 @@ impl SpawnEntityPacket {
             velocity_x: 0,
             velocity_y: 0,
             velocity_z: 0,
+        }
+    }
+
+    /// Creates a spawn packet for a projectile.
+    ///
+    /// The `data` field carries the owner's entity id — vanilla's `Projectile.getAddEntityPacket`
+    /// puts it there so the client can link the projectile to its owner (and a firework rocket
+    /// knows whose elytra flight to boost) — and the velocity fields carry the initial velocity
+    /// in the protocol's fixed point, velocity times 8000.
+    pub fn projectile(
+        entity_id: i32,
+        entity_uuid: u128,
+        entity_type_id: i32,
+        position: &Position,
+        rotation: &Rotation,
+        owner_entity_id: i32,
+        velocity: &Velocity,
+    ) -> Self {
+        let (x, y, z) = position.xyz();
+        let (yaw, pitch) = rotation.yaw_pitch();
+        let fixed_point = |value: f32| -> i16 {
+            (f64::from(value) * 8000.0).clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+        };
+
+        Self {
+            entity_id: VarInt::new(entity_id),
+            entity_uuid,
+            r#type: VarInt::new(entity_type_id),
+            x,
+            y,
+            z,
+            pitch: NetAngle::from_degrees(f64::from(pitch)),
+            yaw: NetAngle::from_degrees(f64::from(yaw)),
+            head_yaw: NetAngle::from_degrees(f64::from(yaw)),
+            data: VarInt::new(owner_entity_id),
+            velocity_x: fixed_point(velocity.x),
+            velocity_y: fixed_point(velocity.y),
+            velocity_z: fixed_point(velocity.z),
         }
     }
 

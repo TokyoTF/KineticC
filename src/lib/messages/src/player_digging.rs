@@ -16,12 +16,18 @@ pub struct PlayerStartedDigging {
 
 /// Fired when the client sends "cancel digging" (status 1).
 ///
+/// The position is the block the client aborted. The client aborts the block it was mining before
+/// it starts a new one, so the two actions can name different blocks - and can arrive in the same
+/// tick. The cancel handler uses the position to avoid cancelling a dig that was just started for
+/// another block.
+///
 /// Fired by: `player_action` packet handler.
 /// Listened for by: `digging_system` (to remove the `PlayerDigging` component).
 #[derive(Message)]
 #[allow(unused)]
 pub struct PlayerCancelledDigging {
     pub player: Entity,
+    pub position: NetworkPosition,
     pub sequence: VarInt,
 }
 

@@ -1,4 +1,3 @@
-use base64::Engine;
 use bevy_ecs::prelude::{Component, Entity, Query};
 use ferrumc_core::identity::player_identity::PlayerIdentity;
 use ferrumc_macros::{packet, NetEncode};
@@ -41,7 +40,8 @@ impl PlayerInfoUpdatePacket {
             let players = query.iter().collect::<Vec<(_, _)>>();
             players
                 .iter()
-                .filter(|&player| player.0 == new_player_id)
+                // The new player already knows about itself, the packet carries everybody else.
+                .filter(|&player| player.0 != new_player_id)
                 .map(|player| player.1)
                 .collect()
         };
@@ -100,8 +100,9 @@ impl PlayerWithActions {
                             .iter()
                             .map(|property| PlayerProperty {
                                 name: property.name.clone(),
-                                value: base64::engine::general_purpose::STANDARD
-                                    .encode(&property.value),
+                                // The profile property value is already the base64 document the
+                                // protocol carries; re-encoding it would send different bytes.
+                                value: property.value.clone(),
                                 signature: PrefixedOptional::new(property.signature.clone()),
                             })
                             .collect(),
@@ -130,4 +131,87 @@ pub struct PlayerProperty {
     pub name: String,
     pub value: String,
     pub signature: PrefixedOptional<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrumc_net_codec::encode::{NetEncode, NetEncodeOpts};
+
+    /// The UUID of a premium account, used as a fixed point in the byte level tests.
+    const NOTCH_UUID: u128 = 0x069a79f444e94726a5befca90e38aaf5;
+
+    /// A `textures` property as returned by Mojang: a base64 document plus its signature.
+    fn textures_property() -> ferrumc_core::identity::player_identity::PlayerProperty {
+        ferrumc_core::identity::player_identity::PlayerProperty {
+            name: "textures".to_string(),
+            value: "eyJ0ZXh0dXJlcyI6e30=".to_string(),
+            signature: Some("sig".to_string()),
+        }
+    }
+
+    fn notch_identity() -> PlayerIdentity {
+        PlayerIdentity::new("Notch".to_string(), NOTCH_UUID, vec![textures_property()])
+    }
+
+    #[test]
+    fn a_profile_property_is_sent_verbatim() {
+        let identity = PlayerIdentity::new(
+            "Notch".to_string(),
+            0,
+            vec![ferrumc_core::identity::player_identity::PlayerProperty {
+                name: "textures".to_string(),
+                value: "eyJ0ZXh0dXJlcyI6e30=".to_string(),
+                signature: Some("signature".to_string()),
+            }],
+        );
+
+        let packet = PlayerInfoUpdatePacket::new_player_join_packet(&identity);
+        let PlayerAction::AddPlayer { properties, .. } = &packet.players.data[0].actions[0] else {
+            panic!("a join packet starts with AddPlayer");
+        };
+
+        assert_eq!(properties.data.len(), 1);
+        assert_eq!(properties.data[0].name, "textures");
+        assert_eq!(properties.data[0].value, "eyJ0ZXh0dXJlcyI6e30=");
+        assert_eq!(
+            properties.data[0].signature,
+            PrefixedOptional::Some("signature".to_string())
+        );
+    }
+
+    #[test]
+    fn the_packet_matches_the_protocol_layout() {
+        let packet = PlayerInfoUpdatePacket::new_player_join_packet(&notch_identity());
+
+        let mut buf = Vec::new();
+        packet
+            .encode(&mut buf, &NetEncodeOpts::None)
+            .expect("the packet encodes");
+
+        // The layout of `player_info_update` (protocol 772) is:
+        //   actions: unsigned byte, players: prefixed array of UUID, and for every player the
+        //   fields of the actions selected by the mask, in mask order.
+        let mut expected: Vec<u8> = vec![
+            0x3F, // packet id
+            0x09, // add player (0x01) | update listed (0x08)
+            0x01, // one player
+            // player UUID
+            0x06, 0x9A, 0x79, 0xF4, 0x44, 0xE9, 0x47, 0x26, 0xA5, 0xBE, 0xFC, 0xA9, 0x0E, 0x38,
+            0xAA, 0xF5, //
+            0x05, // the length of the name
+        ];
+        expected.extend_from_slice(b"Notch");
+        expected.push(0x01); // one property
+        expected.push(0x08); // the length of the property name
+        expected.extend_from_slice(b"textures");
+        expected.push(0x14); // the length of the property value
+        expected.extend_from_slice(b"eyJ0ZXh0dXJlcyI6e30=");
+        expected.push(0x01); // the property is signed
+        expected.push(0x03); // the length of the signature
+        expected.extend_from_slice(b"sig");
+        expected.push(0x01); // listed
+
+        assert_eq!(buf, expected);
+    }
 }

@@ -29,8 +29,8 @@ use ferrumc_state::{GlobalState, GlobalStateResource};
 use ferrumc_world::block_state_id::BlockStateId;
 use ferrumc_world::dimension::Dimension;
 use ferrumc_world::fluid::is_fluid;
-use ferrumc_world::fluid::spread::{fluid_neighbours, would_react, BlockView, FluidChange};
-use ferrumc_world::fluid::{fluid_state, FluidKind, FluidRules};
+use ferrumc_world::fluid::spread::{BlockView, FluidChange, fluid_neighbours, would_react};
+use ferrumc_world::fluid::{FluidKind, FluidRules, fluid_state};
 use ferrumc_world::pos::{BlockPos, ChunkPos};
 use ferrumc_world::scheduler::{BlockTickScheduler, ScheduledTick, TickKind};
 use std::collections::{HashMap, HashSet};
@@ -689,7 +689,7 @@ mod tests {
     use bevy_ecs::prelude::{Schedule, World};
     use ferrumc_macros::block;
     use ferrumc_state::create_test_state;
-    use ferrumc_world::fluid::{fluid_block, fluid_state, FluidKind};
+    use ferrumc_world::fluid::{FluidKind, fluid_block, fluid_state};
     use ferrumc_world::pos::BlockPos;
 
     /// All tests in this module simulate the overworld; this constant keeps the test bodies short

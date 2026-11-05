@@ -123,6 +123,11 @@ pub fn handle(
     }
 }
 
+/// Whether the block at `pos` has a non-empty collision shape and stops entities.
+///
+/// Vanilla collides entities against `getCollisionShape`, so blocks registered with
+/// `noCollission` - plants, torches, redstone wire, buttons, one-layer snow... - let entities
+/// pass through instead of holding them up.
 pub fn is_solid_block(state: &GlobalState, pos: IVec3) -> bool {
     let chunk_coordinates = ChunkPos::from(pos.as_dvec3());
     let block_state =
@@ -130,8 +135,19 @@ pub fn is_solid_block(state: &GlobalState, pos: IVec3) -> bool {
             .expect("Failed to load or generate chunk")
             .get_block(ChunkBlockPos::from(pos));
 
-    !match_block!("air", block_state)
-        && !match_block!("void_air", block_state)
-        && !match_block!("water", block_state)
-        && !match_block!("air", block_state)
+    if match_block!("air", block_state)
+        || match_block!("void_air", block_state)
+        || match_block!("cave_air", block_state)
+        || ferrumc_world::fluid::is_fluid(block_state)
+    {
+        return false;
+    }
+    match block_state.to_block_data() {
+        Some(data) => !crate::systems::block_updates::has_empty_collision(
+            &data.name,
+            data.properties.as_ref(),
+        ),
+        // Unknown state: keep the old behaviour and treat it as solid.
+        None => true,
+    }
 }

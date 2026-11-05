@@ -2,6 +2,7 @@ pub mod chunk_and_light_data;
 pub mod chunk_batch_finish;
 pub mod chunk_batch_start;
 pub mod client_bound_known_packs;
+pub mod container_close;
 pub mod disconnect;
 pub mod finish_configuration;
 pub mod game_event;
@@ -21,6 +22,9 @@ pub mod system_message;
 
 pub mod remove_entities;
 pub mod spawn_entity;
+pub mod take_item_entity;
+
+pub mod open_screen;
 
 pub mod entity_animation;
 pub mod entity_event;
@@ -39,6 +43,7 @@ pub mod update_entity_rotation;
 
 pub mod block_change_ack;
 
+pub mod block_event;
 pub mod block_update;
 
 pub mod command_suggestions;
@@ -53,6 +58,7 @@ pub mod set_container_slot;
 pub mod set_player_inventory_slot;
 
 pub mod particle;
+pub mod play_sound;
 
 pub mod unload_chunk;
 

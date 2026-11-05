@@ -56,6 +56,7 @@ pub struct EntityMetadata {
 pub mod constructors {
     use super::*;
     use crate::packets::outgoing::entity_metadata::extra_data_types::EntityPose;
+    use ferrumc_inventories::slot::InventorySlot;
 
     impl EntityMetadata {
         fn new(index_type: EntityMetadataIndexType, value: EntityMetadataValue) -> Self {
@@ -92,6 +93,25 @@ pub mod constructors {
             )
         }
 
+        /// Entity in fall-flying pose (elytra glide)
+        pub fn entity_fall_flying() -> Self {
+            Self::new(
+                EntityMetadataIndexType::Pose,
+                EntityMetadataValue::Entity6(EntityPose::FallFlying),
+            )
+        }
+
+        /// Entity state with the elytra "flying with elytra" bit (0x80) set. This is the
+        /// shared flag that actually drives the glide animation on the client.
+        pub fn entity_flying_with_elytra() -> Self {
+            Self::new(
+                EntityMetadataIndexType::Byte,
+                EntityMetadataValue::Entity0(EntityStateMask::from_state(
+                    EntityState::FlyingWithElytra,
+                )),
+            )
+        }
+
         /// Entity state with swimming bit set
         pub fn entity_swimming_state() -> Self {
             Self::new(
@@ -123,6 +143,14 @@ pub mod constructors {
                 EntityMetadataValue::Entity0(EntityStateMask::from_state(EntityState::Sprinting)),
             )
         }
+
+        /// The item stack carried by an item entity (metadata index 8).
+        pub fn entity_item_slot(item: InventorySlot) -> Self {
+            Self::new(
+                EntityMetadataIndexType::Slot,
+                EntityMetadataValue::Entity8(item),
+            )
+        }
     }
 }
 
@@ -135,6 +163,7 @@ mod index_type {
     #[derive(Debug, Clone, Copy)]
     pub enum EntityMetadataIndexType {
         Byte, // (0) Used for bit masks and small numbers
+        Slot, // (7) Used for item stacks (item entities)
         Pose, // (21) Used for entity pose - protocol 772 (1.21.4)
     }
 
@@ -143,6 +172,10 @@ mod index_type {
             use EntityMetadataIndexType::*;
             let val = match self {
                 Byte => 0,
+                // Not 6: 6 is Optional Component (a chat), which reads NBT and fails on the item
+                // stack's bytes. It is 7 because the serializer registry registers Byte, Int,
+                // Long, Float, String, Component, Optional Component and *then* ItemStack.
+                Slot => 7,
                 Pose => 21,
             };
 
@@ -172,6 +205,7 @@ mod index_type {
 mod value {
     use super::*;
     use crate::packets::outgoing::entity_metadata::extra_data_types::EntityPose;
+    use ferrumc_inventories::slot::InventorySlot;
     /// Possible metadata values that can be sent
     ///
     /// Couldn't be arsed coming up with the names.
@@ -184,6 +218,7 @@ mod value {
     pub enum EntityMetadataValue {
         Entity0(EntityStateMask),
         Entity6(EntityPose),
+        Entity8(InventorySlot),
     }
 
     impl EntityMetadataValue {
@@ -192,6 +227,7 @@ mod value {
             match self {
                 Entity0(_) => 0,
                 Entity6(_) => 6,
+                Entity8(_) => 8,
             }
         }
     }

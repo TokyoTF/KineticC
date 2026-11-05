@@ -2,7 +2,7 @@ use bevy_ecs::prelude::{Commands, Res, Resource};
 use crossbeam_channel::Receiver;
 use ferrumc_components::player::teleport_tracker::TeleportTracker;
 use ferrumc_components::player::{
-    gamemode::GameModeComponent, offline_player_data::OfflinePlayerData,
+    fall_tracker::FallTracker, gamemode::GameModeComponent, offline_player_data::OfflinePlayerData,
     pending_events::PendingPlayerJoin, player_bundle::PlayerBundle, sneak::SneakState,
     swimming::SwimmingState,
 };
@@ -46,6 +46,18 @@ pub fn accept_new_connections(
             }
         };
         let player_data = offline_data.unwrap_or(OfflinePlayerData::default());
+
+        // The hotbar slot the player had selected is restored, so the server knows what the
+        // player is holding right away: the client only reports the slot when it changes.
+        let hotbar = Hotbar {
+            selected_slot: state
+                .0
+                .world
+                .load_player_hotbar(new_connection.player_identity.uuid)
+                .unwrap_or_default()
+                .unwrap_or(0),
+        };
+
         // --- 2. Build the PlayerBundle ---
         let player_bundle = PlayerBundle {
             identity: new_connection.player_identity.clone(),
@@ -56,7 +68,8 @@ pub fn accept_new_connections(
             on_ground: OnGround::default(),
             chunk_receiver: ChunkReceiver::default(),
             inventory: player_data.inventory,
-            hotbar: Hotbar::default(),
+            hotbar,
+            carried_item: ferrumc_inventories::carried::CarriedItem::default(),
             ender_chest: player_data.ender_chest,
             health: player_data.health,
             hunger: player_data.hunger,
@@ -64,6 +77,7 @@ pub fn accept_new_connections(
             active_effects: player_data.active_effects,
             swimming: SwimmingState::default(),
             sneak: SneakState::default(),
+            fall_tracker: FallTracker::default(),
         };
 
         // --- 3. Spawn the PlayerBundle, then .insert() the network components ---

@@ -178,7 +178,6 @@ reqwest = { version = "0.13.1", features = ["json", "rustls", "blocking", "http2
 
 # Error handling
 thiserror = "2.0.18"
-anyhow = "1.0.100"
 
 # Cryptography
 rand = "0.8.5"

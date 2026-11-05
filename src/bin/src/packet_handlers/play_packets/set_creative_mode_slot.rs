@@ -15,6 +15,13 @@ pub fn handle(
             event.slot, event.slot_index, entity
         );
         if state.0.players.is_connected(entity) {
+            // A slot of -1 means that the item is not placed in the inventory: the client sends it
+            // when an item is taken from the creative listing or dropped outside of the window.
+            // There is nothing to set in that case.
+            if event.slot_index < 0 {
+                continue;
+            }
+
             if let Ok(mut inventory) = query.get_mut(entity) {
                 if event.slot.count.0 == 0 {
                     if let Err(e) =

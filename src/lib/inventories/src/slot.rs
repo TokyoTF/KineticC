@@ -49,7 +49,9 @@ impl Display for InventorySlot {
 impl NetDecode for InventorySlot {
     fn decode<R: Read>(reader: &mut R, opts: &NetDecodeOpts) -> Result<Self, NetDecodeError> {
         let count = VarInt::decode(reader, opts)?;
-        if count.0 == 0 {
+        // Vanilla treats any count <= 0 as an empty slot and reads nothing further
+        // (ItemStack.OPTIONAL_STREAM_CODEC: `if (i <= 0) return ItemStack.EMPTY`).
+        if count.0 <= 0 {
             Ok(Self {
                 count,
                 ..Default::default()
@@ -98,52 +100,31 @@ impl NetEncode for InventorySlot {
         // 1. Always encode the count
         self.count.encode(writer, opts)?;
 
-        // If count is 0, stop immediately
-        if self.count.0 == 0 {
+        // Vanilla treats any count <= 0 as an empty slot and reads nothing further
+        // (ItemStack.OPTIONAL_STREAM_CODEC: `if (i <= 0) return ItemStack.EMPTY`), so a
+        // negative count must stop here too or the extra bytes would desynchronize the
+        // rest of the packet on the client.
+        if self.count.0 <= 0 {
             return Ok(());
         }
 
-        let zero_varint = VarInt::new(0);
-
-        // 2. Encode ItemID
+        // 2. Encode ItemID (0 = minecraft:air when the slot has a count but no item)
         match &self.item_id {
             Some(item_id) => item_id.0.encode(writer, opts)?,
-            None => zero_varint.encode(writer, opts)?,
+            None => VarInt::new(0).encode(writer, opts)?,
         }
 
-        // 3. Get add_count and remove_count
-        let add_count = self
-            .components_to_add_count
-            .as_ref()
-            .unwrap_or(&zero_varint);
-        let remove_count = self
-            .components_to_remove_count
-            .as_ref()
-            .unwrap_or(&zero_varint);
-
-        // 4. Encode components_to_add_count
-        add_count.encode(writer, opts)?;
-
-        // 5. Encode components_to_remove_count
-        remove_count.encode(writer, opts)?;
-
-        // 6. Encode components_to_add list (if any)
-        if add_count.0 > 0
-            && let Some(components) = &self.components_to_add
-        {
-            for component in components {
-                component.encode(writer, opts)?;
-            }
-        }
-
-        // 7. Encode components_to_remove list (if any)
-        if remove_count.0 > 0
-            && let Some(components) = &self.components_to_remove
-        {
-            for component in components {
-                component.encode(writer, opts)?;
-            }
-        }
+        // 3. Encode the component patch counts.
+        //
+        // This model only stores component *type* ids, never their values, but vanilla's
+        // DataComponentPatch.STREAM_CODEC writes a type id **plus the value bytes** for every
+        // added component. Emitting a non-zero add/remove count here would produce a
+        // truncated patch: the client would read the following bytes as component values and
+        // fail to decode the whole packet ("Failed to decode packet
+        // 'clientbound/minecraft:container_set_content'"). So the patch is always sent
+        // empty, which is decodable regardless of what is stored.
+        VarInt::new(0).encode(writer, opts)?; // components_to_add_count
+        VarInt::new(0).encode(writer, opts)?; // components_to_remove_count
 
         Ok(())
     }
@@ -193,8 +174,7 @@ mod tests {
 
     #[test]
     fn test_slot_encode_decode_roundtrip() {
-        // --- Test Case 1: The Empty Slot ---
-
+        // A slot without components round-trips unchanged.
         let simple_slot = InventorySlot {
             count: VarInt::new(10),
             item_id: Some(ItemID::new(1)),
@@ -206,20 +186,67 @@ mod tests {
 
         let decoded_simple = run_roundtrip_test(&simple_slot);
         assert_eq!(simple_slot, decoded_simple, "Simple slot roundtrip failed");
+    }
 
-        // --- Test Case 2: The Full NBT/Component Slot ---
-        let complex_slot = InventorySlot {
-            count: VarInt::new(1),
-            item_id: Some(ItemID::new(872)),
-            components_to_add_count: Some(VarInt::new(2)),
-            components_to_remove_count: Some(VarInt::new(1)),
-            components_to_add: Some(vec![VarInt::new(10), VarInt::new(11)]),
-            components_to_remove: Some(vec![VarInt::new(20)]),
+    /// Vanilla layout of a slot: count VarInt; if count <= 0 nothing more; otherwise item id
+    /// VarInt, then the component patch counts (add, remove). See ItemStack.OPTIONAL_STREAM_CODEC
+    /// and DataComponentPatch.STREAM_CODEC in 1.21.8.
+    #[test]
+    fn test_empty_slot_encodes_as_single_zero() {
+        let mut buffer = Vec::new();
+        InventorySlot::empty()
+            .encode(&mut buffer, &NetEncodeOpts::default())
+            .unwrap();
+        assert_eq!(buffer, vec![0x00]);
+    }
+
+    /// A negative count is an empty slot for the client and must not be followed by anything,
+    /// otherwise the rest of the packet desynchronizes (count <= 0, not just == 0).
+    #[test]
+    fn test_negative_count_encodes_as_count_only() {
+        let slot = InventorySlot {
+            count: VarInt::new(-999),
+            item_id: Some(ItemID::new(1)),
+            ..Default::default()
         };
-        let decoded_complex = run_roundtrip_test(&complex_slot);
-        assert_eq!(
-            complex_slot, decoded_complex,
-            "Complex slot roundtrip failed"
-        );
+        let mut buffer = Vec::new();
+        slot.encode(&mut buffer, &NetEncodeOpts::default()).unwrap();
+        // VarInt(-999) = 0x99 0xf8 0xff 0xff 0x0f, and nothing after it.
+        assert_eq!(buffer, vec![0x99, 0xf8, 0xff, 0xff, 0x0f]);
+    }
+
+    /// The component fields only store type ids, never values, so they must never go on the
+    /// wire: vanilla expects type id + value bytes per added component, and a count without
+    /// values makes the client fail to decode the whole packet. This is the regression test
+    /// for the join-time "Failed to decode packet 'container_set_content'" crash caused by a
+    /// saved firework_rocket stack carrying a `minecraft:fireworks` (type 60) component.
+    #[test]
+    fn test_components_are_never_emitted_on_the_wire() {
+        let slot = InventorySlot {
+            count: VarInt::new(64),
+            item_id: Some(ItemID::new(1192)), // minecraft:firework_rocket
+            components_to_add_count: Some(VarInt::new(1)),
+            components_to_remove_count: Some(VarInt::new(0)),
+            components_to_add: Some(vec![VarInt::new(60)]), // minecraft:fireworks
+            components_to_remove: Some(vec![]),
+        };
+        let mut buffer = Vec::new();
+        slot.encode(&mut buffer, &NetEncodeOpts::default()).unwrap();
+        // 64 = 0x40, item 1192 = VarInt 0xa8 0x09, then an empty patch (0, 0).
+        assert_eq!(buffer, vec![0x40, 0xa8, 0x09, 0x00, 0x00]);
+    }
+
+    /// A slot with a count but no item id encodes the item as air (id 0), which the client
+    /// accepts, instead of shifting the whole packet.
+    #[test]
+    fn test_count_without_item_encodes_air() {
+        let slot = InventorySlot {
+            count: VarInt::new(5),
+            item_id: None,
+            ..Default::default()
+        };
+        let mut buffer = Vec::new();
+        slot.encode(&mut buffer, &NetEncodeOpts::default()).unwrap();
+        assert_eq!(buffer, vec![0x05, 0x00, 0x00, 0x00]);
     }
 }

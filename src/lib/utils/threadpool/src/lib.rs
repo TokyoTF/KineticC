@@ -2,6 +2,7 @@ use rusty_pool::JoinHandle;
 use std::cmp::max;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::warn;
 
 /// A thread pool for managing and executing tasks concurrently.
 pub struct ThreadPool {
@@ -138,10 +139,8 @@ impl<'a, R: Send + 'static> ThreadPoolBatch<'a, R> {
     /// Waits for all tasks in the batch to complete and returns their results.
     ///
     /// # Returns
-    /// A vector of results from the completed tasks.
-    ///
-    /// # Panics
-    /// Will panic if the batch has already been completed.
+    /// A vector of results from the completed tasks. Tasks that panicked are left out, because
+    /// a panicking task drops the channel that carries its result.
     pub fn wait(mut self) -> Vec<R> {
         if self.completed {
             panic!("Batch already completed");
@@ -149,8 +148,14 @@ impl<'a, R: Send + 'static> ThreadPoolBatch<'a, R> {
 
         let mut results = Vec::with_capacity(self.handles.len());
         for handle in self.handles {
-            let result = handle.await_complete();
-            results.push(*result);
+            match handle.try_await_complete() {
+                Ok(result) => results.push(*result),
+                // A task that panicked takes the whole server down when the panic is propagated,
+                // so the task is skipped and the rest of the batch is still waited for.
+                Err(_) => {
+                    warn!("A task in the batch panicked and did not return a result, skipping it.")
+                }
+            }
         }
         self.completed = true;
         results
@@ -164,8 +169,14 @@ impl<'a, R: Send + 'static> ThreadPoolBatch<'a, R> {
         self.completed = true;
 
         if let Some(handle) = self.handles.pop() {
-            let result = handle.await_complete();
-            Some(*result)
+            // See `wait` for why a panicking task is not propagated.
+            match handle.try_await_complete() {
+                Ok(result) => Some(*result),
+                Err(_) => {
+                    warn!("A task in the batch panicked and did not return a result, skipping it.");
+                    None
+                }
+            }
         } else {
             None
         }

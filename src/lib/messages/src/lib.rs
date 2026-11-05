@@ -7,6 +7,9 @@ pub use player_digging::*;
 pub mod player_eat;
 pub use player_eat::*;
 
+pub mod player_exhaustion;
+pub use player_exhaustion::*;
+
 pub mod player_exp;
 pub use player_exp::*;
 

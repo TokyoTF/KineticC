@@ -20,9 +20,9 @@ struct ItemEntry {
 
 #[derive(Deserialize)]
 struct BlockEntry {
-    // We only care about hardness for now
     // It's sometimes missing (like for Air), so it's an Option
     hardness: Option<f32>,
+    protocol_id: i32,
 }
 
 #[derive(Deserialize)]
@@ -123,13 +123,23 @@ fn main() {
         "static BLOCK_NAME_TO_HARDNESS: phf::Map<&'static str, u32> = "
     )
     .unwrap();
+    let mut block_id_map = Map::new();
     let mut hardness_map = Map::new();
     for (name, entry) in registry.block.entries {
         // We store the f32 as a u32 to use it in the const map
         // (PHF maps don't like f32). We'll convert it back at runtime.
         let hardness_f32 = entry.hardness.unwrap_or(0.0);
         let hardness_u32 = hardness_f32.to_bits();
-        hardness_map.entry(name, &hardness_u32.to_string());
+        hardness_map.entry(name.clone(), &hardness_u32.to_string());
+        // The block's own id, which packets such as block events use instead of a state id.
+        block_id_map.entry(name, &entry.protocol_id.to_string());
     }
     writeln!(file, "{};\n", hardness_map.build()).unwrap();
+
+    write!(
+        file,
+        "static BLOCK_NAME_TO_ID: phf::Map<&'static str, i32> = "
+    )
+    .unwrap();
+    writeln!(file, "{};\n", block_id_map.build()).unwrap();
 }

@@ -58,8 +58,7 @@ pub fn handle(
 
         trace!(
             "Player {} left: notified {} remaining players",
-            left_player.username,
-            notified_count
+            left_player.username, notified_count
         );
     }
 }

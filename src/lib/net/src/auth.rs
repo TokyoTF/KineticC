@@ -1,5 +1,4 @@
 use crate::errors::NetAuthenticationError;
-use base64::Engine;
 use ferrumc_core::identity::player_identity::PlayerProperty;
 use ferrumc_net_encryption::minecraft_hex_digest;
 use serde_derive::Deserialize;
@@ -18,7 +17,8 @@ use uuid::Uuid;
 /// `(String, Uuid, Vec<PlayerProperty>)`: The data returned by Mojang upon successful authentication.
 /// - `String`: The official username of the player from Mojang.
 /// - `Uuid`: The official uuid of the player from Mojang.
-/// - `Vec<PlayerProperty>`: The player properties returned by Mojang.
+/// - `Vec<PlayerProperty>`: The profile properties returned by Mojang, including the base64 texture
+///   blob that carries the player's skin. The values are passed through unchanged.
 ///
 /// # Error
 /// A `NetAuthenticationError` upon an unsuccessful authentication. See the `NetAuthenticationError` enum for more information.
@@ -50,26 +50,35 @@ pub(crate) async fn authenticate_user(
         .await
         .map_err(|err| NetAuthenticationError::ParseError(Arc::new(err)))?;
 
-    let username = response.name.clone();
-    let uuid = Uuid::from_str(&response.id).map_err(|_| NetAuthenticationError::CorruptUuid)?;
-    let mut properties: Vec<PlayerProperty> = vec![];
+    parse_auth_response(response)
+}
 
-    for property in response.properties {
-        properties.push(PlayerProperty {
+/// Turns the payload returned by Mojang's session server into a username, a UUID and the
+/// profile properties.
+///
+/// The property values are kept exactly as Mojang returned them. A `textures` property is a
+/// base64 document holding the URLs of the player's skin and cape, and that is the encoding the
+/// protocol carries on the wire. Decoding the base64 here and re-encoding it later would make the
+/// two packet paths disagree with the session server, and the client would fall back to a default
+/// skin.
+fn parse_auth_response(
+    response: MojangAuthResponse,
+) -> Result<(String, Uuid, Vec<PlayerProperty>), NetAuthenticationError> {
+    let username = response.name;
+    let uuid = Uuid::from_str(&response.id).map_err(|_| NetAuthenticationError::CorruptUuid)?;
+    let properties: Vec<PlayerProperty> = response
+        .properties
+        .into_iter()
+        .map(|property| PlayerProperty {
             name: property.name,
             signature: if property.signature.is_empty() {
                 None
             } else {
                 Some(property.signature)
             },
-            value: String::from_utf8(
-                base64::engine::general_purpose::STANDARD
-                    .decode(&property.value)
-                    .map_err(|err| NetAuthenticationError::ParseError(Arc::new(err)))?,
-            )
-            .map_err(|err| NetAuthenticationError::ParseError(Arc::new(err)))?,
+            value: property.value,
         })
-    }
+        .collect();
 
     Ok((username, uuid, properties))
 }
@@ -86,5 +95,71 @@ struct MojangAuthResponse {
 struct MojangAuthProperty {
     name: String,
     value: String,
+    #[serde(default)]
     signature: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `hasJoined` payload as returned by Mojang's session server, with the base64 texture
+    /// document and the signature of a premium account.
+    const SIGNED_RESPONSE: &str = r#"{
+        "id": "069a79f444e94726a5befca90e38aaf5",
+        "name": "Notch",
+        "properties": [
+            {
+                "name": "textures",
+                "value": "eyJ0aW1lc3RhbXAiOjE3OTM2MTEwNTg2NzgsInByb2ZpbGVJZCI6IjA2OWE3OWY0NDRlOTQ3MjZhNWJlZmNhOTBlMzhhYWY1In0=",
+                "signature": "c2lnbmF0dXJl"
+            }
+        ]
+    }"#;
+
+    /// A payload for an account without a signed texture property.
+    const UNSIGNED_RESPONSE: &str = r#"{
+        "id": "069a79f444e94726a5befca90e38aaf5",
+        "name": "Notch",
+        "properties": [
+            {
+                "name": "textures",
+                "value": "eyJ0ZXh0dXJlcyI6e30="
+            }
+        ]
+    }"#;
+
+    fn parse(json: &str) -> (String, Uuid, Vec<PlayerProperty>) {
+        let response: MojangAuthResponse =
+            serde_json::from_str(json).expect("the payload is valid json");
+
+        parse_auth_response(response).expect("the payload holds a valid uuid")
+    }
+
+    #[test]
+    fn the_texture_property_is_forwarded_verbatim() {
+        let (username, uuid, properties) = parse(SIGNED_RESPONSE);
+
+        assert_eq!(username, "Notch");
+        assert_eq!(
+            uuid,
+            Uuid::from_str("069a79f444e94726a5befca90e38aaf5").expect("a valid uuid")
+        );
+        assert_eq!(properties.len(), 1);
+        assert_eq!(properties[0].name, "textures");
+        assert_eq!(
+            properties[0].value,
+            "eyJ0aW1lc3RhbXAiOjE3OTM2MTEwNTg2NzgsInByb2ZpbGVJZCI6IjA2OWE3OWY0NDRlOTQ3MjZhNWJlZmNhOTBlMzhhYWY1In0="
+        );
+        assert_eq!(properties[0].signature, Some("c2lnbmF0dXJl".to_string()));
+    }
+
+    #[test]
+    fn a_missing_signature_becomes_no_signature() {
+        let (_, _, properties) = parse(UNSIGNED_RESPONSE);
+
+        assert_eq!(properties.len(), 1);
+        assert_eq!(properties[0].value, "eyJ0ZXh0dXJlcyI6e30=");
+        assert_eq!(properties[0].signature, None);
+    }
 }

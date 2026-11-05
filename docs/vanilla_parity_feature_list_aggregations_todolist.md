@@ -118,6 +118,7 @@
 ### **Player Entity**
 - [x] **Gamemodes** — [`src/lib/components/src/player/gamemode.rs`](../src/lib/components/src/player/gamemode.rs). All 4 modes: Survival, Creative, Adventure, Spectator. Configurable default in config.
 - [x] **Abilities** — [`src/lib/components/src/player/abilities.rs`](../src/lib/components/src/player/abilities.rs). Flying, invulnerable, may_fly, creative_mode, may_build, flying_speed, walking_speed. Mode-specific ability presets.
+- [x] **Skins (online mode)** — The `textures` property Mojang returns at login is forwarded verbatim, together with its signature, in Login Success and Player Info Update, so premium players keep their skin, cape and signature. The identity that the server announces is the one Mojang verified. See [`docs/skins.md`](skins.md). **Missing:** premium skin lookup for offline-mode names.
 - [/] **Food/Exhaustion/Saturation** — `Hunger` component in [`src/lib/components/src/player/hunger.rs`](../src/lib/components/src/player/hunger.rs) with level/saturation/exhaustion. **Missing:** Exhaustion tick logic.
 - [/] **XP/Leveling** — `Experience` component in [`src/lib/components/src/player/experience.rs`](../src/lib/components/src/player/experience.rs) with progress/level/total_xp. **Missing:** Level calculation formulas.
 - [ ] **Statistics tracking** — Not implemented.
@@ -133,7 +134,7 @@
 - [/] **Mobs** — Partial implementation. **Implemented:** Pig entity (`PigBundle`) with full component set (physics, combat, metadata). **Missing:** AI, other mobs.
 - [ ] **Projectiles** — Not implemented.
 - [ ] **Vehicles** — Not implemented.
-- [ ] **Items** — Not implemented. No item entities.
+- [/] **Items** — Dropped item entities exist: blocks drop an item when broken ([`src/bin/src/systems/item_entities.rs`](../src/bin/src/systems/item_entities.rs)), the drop key drops the item the player has selected ([`src/bin/src/packet_handlers/play_packets/player_action.rs`](../src/bin/src/packet_handlers/play_packets/player_action.rs)), the entity falls, rests on the surface and is collected by a nearby player into their inventory. The placement handler spends the item it placed ([`src/bin/src/packet_handlers/play_packets/place_block.rs`](../src/bin/src/packet_handlers/play_packets/place_block.rs)), and the server pushes the player inventory on join so the client and the server agree on the held item ([`src/bin/src/packet_handlers/play_packets/player_loaded.rs`](../src/bin/src/packet_handlers/play_packets/player_loaded.rs)). **Missing:** stack merging, item despawning after five minutes, item entities dropped by mobs or on death.
 - [ ] **Displays** — Not implemented.
 
 ---
@@ -146,8 +147,9 @@
 
 ### **Container Logic**
 - [x] **Slots** — [`src/lib/inventories/src/slot.rs`](../src/lib/inventories/src/slot.rs), [`defined_slots.rs`](../src/lib/inventories/src/defined_slots.rs). Slot indexing with item optional.
-- [/] **Window Types** — Player inventory only. **Missing:** Chest, furnace, anvil, etc.
-- [/] **Synchronization** — Container content/slot packets in [`src/lib/net/src/packets/outgoing/`](../src/lib/net/src/packets/outgoing/). Click handling in [`src/bin/src/packet_handlers/play_packets/`](../src/bin/src/packet_handlers/play_packets/).
+- [/] **Window Types** — The player inventory (window 0) and chests are implemented: single chests use `generic_9x3` and double chests `generic_9x6`, see [`docs/containers.md`](containers.md). **Missing:** furnace, anvil, hopper, barrel and other container types.
+- [x] **Chests** — [`src/bin/src/systems/chests.rs`](../src/bin/src/systems/chests.rs). Per-block inventories persisted as block entities, double-chest pairing through the `type` block state property, container clicks routed between chest and player, contents dropped on break, lid animation through `block_event`. See [`docs/containers.md`](containers.md). **Missing:** waterlogging, the vanilla "no block above" pairing rule.
+- [/] **Synchronization** — Container content/slot packets in [`src/lib/net/src/packets/outgoing/`](../src/lib/net/src/packets/outgoing/). Click handling in [`src/bin/src/packet_handlers/play_packets/`](../src/bin/src/packet_handlers/play_packets/). The server trusts the click diff the client reports instead of re-implementing every click mode.
 
 ### **Recipe System**
 - [ ] **Recipe Registry** — Not implemented.
@@ -159,9 +161,9 @@
 ## VI. Gameplay Mechanics (The Logic)
 
 ### **Interaction Processing**
-- [x] **Player Digging** — [`src/bin/src/packet_handlers/play_packets/player_action.rs`](../src/bin/src/packet_handlers/play_packets/player_action.rs). Creative insta-break works. Survival digging events emitted. **Missing:** Break speed calculation, tool efficiency.
-- [x] **Block Placing** — [`src/bin/src/packet_handlers/play_packets/place_block.rs`](../src/bin/src/packet_handlers/play_packets/place_block.rs). Item-to-block mapping, face-based offset calculation, collision checking with players.
-- [ ] **Item Usage** — Not implemented. No eating/bow/shield.
+- [x] **Player Digging** — [`src/bin/src/packet_handlers/play_packets/player_action.rs`](../src/bin/src/packet_handlers/play_packets/player_action.rs) and [`src/bin/src/systems/listeners/digging_system.rs`](../src/bin/src/systems/listeners/digging_system.rs). Break timing uses the vanilla damage-per-tick formula from [`src/bin/src/systems/mining.rs`](../src/bin/src/systems/mining.rs): `tool_speed / hardness / (30 or 100)`, with the tool speed read from the item's `minecraft:tool` component and the hardness from the block data. Broken blocks drop what vanilla drops: [`src/bin/src/systems/drops.rs`](../src/bin/src/systems/drops.rs) follows the loot table of the block for the item and the amount, and a block that needs the correct tool only drops when the held tool is right for it, using the first matching rule of the item's `minecraft:tool` component. **Missing:** mining fatigue and haste effects, silk touch, fortune.
+- [x] **Block Placing** — [`src/bin/src/packet_handlers/play_packets/place_block.rs`](../src/bin/src/packet_handlers/play_packets/place_block.rs). Item-to-block mapping, face-based offset calculation, collision checking with players. Chests are intercepted before placement so a right click opens the screen, and a placed chest joins a matching neighbour into a double chest.
+- [/] **Item Usage** — Eating works: the `use_item` packet handler ([`src/bin/src/packet_handlers/play_packets/use_item.rs`](../src/bin/src/packet_handlers/play_packets/use_item.rs)) and [`src/bin/src/systems/hunger.rs`](../src/bin/src/systems/hunger.rs) read the `minecraft:food` component of the held item, consume one unit and raise the food level. **Missing:** bows, shields, buckets, potions, projectile entities.
 
 ### **Redstone Engine**
 - [ ] **Signal strength propagation** — Not implemented.
@@ -176,7 +178,7 @@
 
 ### **Combat System**
 - [ ] **Attack Cooldown** — Not implemented.
-- [ ] **Damage Sources** — Not implemented.
+- [/] **Damage Sources** — The `interact` packet is handled by [`src/bin/src/packet_handlers/play_packets/interact.rs`](../src/bin/src/packet_handlers/play_packets/interact.rs), which validates the hit range and emits a `PlayerDamaged` event with a `DamageSource` ([`src/lib/messages/src/player_damage.rs`](../src/lib/messages/src/player_damage.rs)). [`src/bin/src/systems/health_system.rs`](../src/bin/src/systems/health_system.rs) applies it, sends the health and hurt-animation packets, fires `PlayerDied`, and [`src/bin/src/systems/listeners/player_death.rs`](../src/bin/src/systems/listeners/player_death.rs) respawns the player at the world spawn on `client_command`. **Missing:** only player-vs-player combat exists; mobs cannot be damaged yet, damage is not scaled by weapon, and there is no fall/void/starvation damage wire-up.
 - [ ] **Armor formulas** — Not implemented.
 - [ ] **Knockback** — Not implemented.
 - [ ] **Critical Hits** — Not implemented.

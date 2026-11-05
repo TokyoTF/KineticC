@@ -20,6 +20,11 @@ impl PlayerIdentity {
     }
 }
 
+/// A profile property, as returned by Mojang's session server.
+///
+/// `value` is kept in the encoding the session server returned: a base64 document holding the
+/// player's textures. The protocol expects that encoding on the wire, so the value is passed through
+/// untouched; decoding it here and re-encoding later would make the two packet paths disagree.
 #[derive(Debug, Default, Clone)]
 pub struct PlayerProperty {
     pub name: String,

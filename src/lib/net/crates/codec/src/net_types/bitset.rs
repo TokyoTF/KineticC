@@ -48,9 +48,7 @@ impl BitSet {
 
     pub fn set_all(&mut self, is_set: bool) {
         let value = if is_set { 0xFFFFFFFFFFFFFFFF } else { 0 };
-        for val in &mut self.0 {
-            *val = value;
-        }
+        self.0.fill(value);
     }
 }
 

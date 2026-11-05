@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 rusty_pool = { workspace = true }
 num_cpus = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

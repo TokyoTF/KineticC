@@ -1,9 +1,26 @@
-use bevy_ecs::prelude::Query;
+use bevy_ecs::prelude::{Query, Without};
 use bevy_math::Vec3A;
+use ferrumc_components::item_entity::ItemEntity;
+use ferrumc_components::projectile::Projectile;
 use ferrumc_core::transform::position::Position;
 use ferrumc_core::transform::velocity::Velocity;
 
-pub fn handle(mut query: Query<(&Velocity, &mut Position)>) {
+/// Entities the generic velocity mover skips: item entities and projectiles integrate their own
+/// movement in their tick systems.
+type VelocityQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static Velocity, &'static mut Position),
+    (Without<ItemEntity>, Without<Projectile>),
+>;
+
+/// Moves every entity by its velocity.
+///
+/// Item entities and projectiles are excluded: `tick_item_entities` and `tick_projectiles`
+/// already integrate their velocity into their position (they have to, so they can stop on a
+/// block surface or detect a hit), and moving them here as well made every dropped stack fall at
+/// twice its speed.
+pub fn handle(mut query: VelocityQuery) {
     for (vel, mut pos) in query.iter_mut() {
         if **vel == Vec3A::ZERO {
             continue;

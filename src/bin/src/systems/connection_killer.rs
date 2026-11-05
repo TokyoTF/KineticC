@@ -12,6 +12,7 @@ use ferrumc_core::{
     identity::player_identity::PlayerIdentity,
     transform::{position::Position, rotation::Rotation},
 };
+use ferrumc_inventories::hotbar::Hotbar;
 use ferrumc_inventories::inventory::Inventory;
 use ferrumc_messages::player_leave::PlayerLeft;
 use ferrumc_net::connection::StreamWriter;
@@ -29,6 +30,7 @@ type PlayerCacheQuery<'a> = (
     &'a Position,
     &'a Rotation,
     &'a Inventory,
+    &'a Hotbar,
     &'a Health,
     &'a Hunger,
     &'a Experience,
@@ -63,6 +65,7 @@ pub fn connection_killer(
             pos,
             rot,
             inv,
+            hotbar,
             health,
             hunger,
             exp,
@@ -123,6 +126,18 @@ pub fn connection_killer(
             {
                 warn!(
                     "Failed to save player data for {}: {:?}",
+                    player_identity.username, err
+                );
+            }
+
+            // The selected hotbar slot is saved apart from the rest of the player data.
+            if let Err(err) = state
+                .0
+                .world
+                .save_player_hotbar(player_identity.uuid, hotbar.selected_slot)
+            {
+                warn!(
+                    "Failed to save the hotbar slot for {}: {:?}",
                     player_identity.username, err
                 );
             }

@@ -1,2 +1,4 @@
-dashboard-dist/
-!dashboard-dist/.gitkeep
+# The dashboard build is vendored into the crate (dashboard-dist/) so that
+# compiling the server never needs to download it. Keep it tracked.
+# dashboard-dist/
+# !dashboard-dist/.gitkeep

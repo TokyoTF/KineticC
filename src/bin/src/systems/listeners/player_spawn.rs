@@ -106,9 +106,7 @@ pub fn handle(
 
         trace!(
             "Player {} joined: sent {} existing players, spawned for {} existing players",
-            new_player_identity.username,
-            spawned_for_new_player,
-            spawned_for_existing
+            new_player_identity.username, spawned_for_new_player, spawned_for_existing
         );
     }
 }

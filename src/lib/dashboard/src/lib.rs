@@ -72,15 +72,9 @@ const PROTOCOL: &str = "http";
 
 /// This macro runs at COMPILE TIME.
 /// It embeds the entire dashboard directory into the binary.
-/// Uses OUT_DIR if available, otherwise falls back to CARGO_MANIFEST_DIR.
-#[cfg(dashboard_in_out_dir)]
-static DASHBOARD_DIR: Dir<'_> = include_dir!("$OUT_DIR/dashboard");
-
-#[cfg(dashboard_in_manifest_dir)]
-static DASHBOARD_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/dashboard-dist");
-
-// Fallback if neither cfg is set (shouldn't happen, but prevents compile errors)
-#[cfg(not(any(dashboard_in_out_dir, dashboard_in_manifest_dir)))]
+///
+/// The files live in `dashboard-dist/` inside this crate and are committed to
+/// the repository, so a build never downloads anything from the network.
 static DASHBOARD_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/dashboard-dist");
 
 async fn start_webserver(state: GlobalState) {

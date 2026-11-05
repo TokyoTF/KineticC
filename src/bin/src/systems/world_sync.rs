@@ -12,6 +12,7 @@ use ferrumc_core::chunks::world_sync_tracker::WorldSyncTracker;
 use ferrumc_core::identity::player_identity::PlayerIdentity;
 use ferrumc_core::transform::position::Position;
 use ferrumc_core::transform::rotation::Rotation;
+use ferrumc_inventories::hotbar::Hotbar;
 use ferrumc_inventories::inventory::Inventory;
 use ferrumc_state::GlobalStateResource;
 
@@ -23,6 +24,7 @@ pub fn sync_world(
         &Position,
         &Rotation,
         &Inventory,
+        &Hotbar,
         &Health,
         &Hunger,
         &Experience,
@@ -46,6 +48,7 @@ pub fn sync_world(
         position,
         rotation,
         inventory,
+        hotbar,
         health,
         hunger,
         experience,
@@ -70,6 +73,13 @@ pub fn sync_world(
             .world
             .save_player_data(identity.uuid, &data)
             .expect("Failed to save player data");
+
+        // The selected hotbar slot is kept apart from the rest of the player data.
+        state
+            .0
+            .world
+            .save_player_hotbar(identity.uuid, hotbar.selected_slot)
+            .expect("Failed to save the hotbar slot");
     }
 
     last_synced.last_synced = std::time::Instant::now();

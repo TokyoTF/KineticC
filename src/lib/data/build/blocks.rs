@@ -28,6 +28,15 @@ pub struct Block {
 // Properties are actually integers in the JSON format
 pub type Property = i32;
 
+/// The bit in a state's flag bits that marks the block as needing the correct tool to drop
+/// anything.
+///
+/// Vanilla keeps this as a per block flag (`requiresCorrectToolForDrops`). The extracted block
+/// data packs a handful of those per block properties into the state's flag bits, and this is
+/// the one that says whether a block only drops its items when it is mined with a tool that is
+/// correct for it.
+const REQUIRES_CORRECT_TOOL_FLAG: u32 = 0b100;
+
 #[derive(Debug, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct State {
@@ -90,6 +99,7 @@ pub fn build() -> Result<(), Box<dyn std::error::Error>> {
     types_content.push_str("    pub jump_velocity_multiplier: f32,\n");
     types_content.push_str("    pub luminance: u32,\n");
     types_content.push_str("    pub item_id: u32,\n");
+    types_content.push_str("    pub requires_correct_tool_for_drops: bool,\n");
     types_content.push_str("}\n\n");
 
     types_content.push_str("#[derive(Debug, Clone, Copy)]\n");
@@ -170,6 +180,17 @@ pub fn build() -> Result<(), Box<dyn std::error::Error>> {
         let first_state = &block.states[0];
         content.push_str(&format!("    luminance: {},\n", first_state.luminance));
         content.push_str(&format!("    item_id: {},\n", block.item_id));
+        // Whether the block only drops its items when it is mined with the correct tool. The flag
+        // is a property of the block, so the default state is the one that decides it.
+        let default_state = block
+            .states
+            .iter()
+            .find(|state| state.id == block.default_state_id)
+            .unwrap_or(first_state);
+        content.push_str(&format!(
+            "    requires_correct_tool_for_drops: {},\n",
+            default_state.state_flags & REQUIRES_CORRECT_TOOL_FLAG != 0
+        ));
         content.push_str("};\n\n");
 
         // States

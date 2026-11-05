@@ -41,6 +41,14 @@ pub fn lookup_block_hardness(block_name: &str) -> Option<f32> {
         .map(|hardness_u32| f32::from_bits(*hardness_u32))
 }
 
+/// Looks up a block's protocol ID (e.g., 188 for `minecraft:chest`) from its name.
+///
+/// This is the *block* id, not a block *state* id: packets such as `block_event` carry the former,
+/// while chunk and block-update packets carry the latter.
+pub fn lookup_block_protocol_id(block_name: &str) -> Option<i32> {
+    BLOCK_NAME_TO_ID.get(block_name).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +132,16 @@ mod tests {
             "lookup_item_to_block_id_str(\"1\") returned None"
         );
         assert_eq!(block_id_str.unwrap(), "1");
+    }
+
+    #[test]
+    fn test_lookup_block_protocol_id() {
+        setup();
+
+        assert_eq!(lookup_block_protocol_id("minecraft:chest"), Some(188));
+        assert_eq!(
+            lookup_block_protocol_id("minecraft:non_existent_block"),
+            None
+        );
     }
 }
