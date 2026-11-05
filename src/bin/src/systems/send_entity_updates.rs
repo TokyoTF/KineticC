@@ -1,5 +1,6 @@
 #![expect(clippy::type_complexity)]
 use bevy_ecs::prelude::{MessageReader, Query};
+use bevy_math::Vec3A;
 use ferrumc_core::identity::entity_identity::EntityIdentity;
 use ferrumc_core::identity::player_identity::PlayerIdentity;
 use ferrumc_core::transform::grounded::OnGround;
@@ -10,9 +11,10 @@ use ferrumc_entities::LastSyncedPosition;
 use ferrumc_messages::entity_update::SendEntityUpdate;
 use ferrumc_net::connection::StreamWriter;
 use ferrumc_net::packets::outgoing::entity_position_sync::TeleportEntityPacket;
+use ferrumc_net::packets::outgoing::set_entity_motion::SetEntityMotionPacket;
 use ferrumc_net::packets::outgoing::update_entity_position_and_rotation::UpdateEntityPositionAndRotationPacket;
 use ferrumc_net_codec::net_types::angle::NetAngle;
-use tracing::warn;
+use tracing::{debug, warn};
 
 pub fn handle(
     mut query: Query<(
@@ -95,13 +97,29 @@ pub fn handle(
                         );
                     }
                 }
+                // Vanilla `ServerEntity.sendChanges` sends `ClientboundSetEntityMotionPacket`
+                // whenever the velocity changed since the last send (for a falling item that is
+                // every tick). A moving entity keeps its client-side velocity in sync this way;
+                // a resting one (zero velocity) sends none.
+                if **vel != Vec3A::ZERO {
+                    let motion_packet = SetEntityMotionPacket::new(id, vel);
+                    for conn in conn_query.iter_mut() {
+                        if let Err(e) = conn.send_packet_ref(&motion_packet) {
+                            warn!(
+                                "Failed to send entity motion packet for entity {:?}: {:?}",
+                                entity, e
+                            );
+                        }
+                    }
+                }
             };
             *last_synced = LastSyncedPosition(pos.coords);
         } else {
-            warn!(
-                "Tried to send entity update for non-existent entity: {:?}",
-                entity
-            );
+            // Legitimate when the entity was removed after the update was queued (picked up,
+            // merged, expired): updates are read one tick after they are written, and by then the
+            // entity may be gone. Vanilla's ServerEntity likewise sends nothing for removed
+            // entities, so skip quietly instead of warning.
+            debug!("Skipping entity update for removed entity: {entity:?}");
         }
     }
 }

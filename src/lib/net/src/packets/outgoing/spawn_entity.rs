@@ -62,6 +62,41 @@ impl SpawnEntityPacket {
         }
     }
 
+    /// Creates a spawn packet for a dropped item.
+    ///
+    /// Vanilla's `ClientboundAddEntityPacket` carries the entity's initial velocity in the
+    /// protocol's fixed point (`clamp(v, -3.9, 3.9) * 8000`). The client runs the item's own fall
+    /// physics starting from that velocity, so spawning with a zeroed velocity makes the
+    /// client-side stack fall behind the server's, and the server's position updates then jitter
+    /// it until it lands. `data` stays 0 for items; the stack itself goes in the entity metadata.
+    pub fn item(
+        entity_id: i32,
+        entity_uuid: u128,
+        entity_type_id: i32,
+        position: &Position,
+        rotation: &Rotation,
+        velocity: &Velocity,
+    ) -> Self {
+        let (x, y, z) = position.xyz();
+        let (yaw, pitch) = rotation.yaw_pitch();
+
+        Self {
+            entity_id: VarInt::new(entity_id),
+            entity_uuid,
+            r#type: VarInt::new(entity_type_id),
+            x,
+            y,
+            z,
+            pitch: NetAngle::from_degrees(f64::from(pitch)),
+            yaw: NetAngle::from_degrees(f64::from(yaw)),
+            head_yaw: NetAngle::from_degrees(f64::from(yaw)),
+            data: VarInt::new(0),
+            velocity_x: super::set_entity_motion::encode_velocity(velocity.x),
+            velocity_y: super::set_entity_motion::encode_velocity(velocity.y),
+            velocity_z: super::set_entity_motion::encode_velocity(velocity.z),
+        }
+    }
+
     /// Creates a spawn packet for a projectile.
     ///
     /// The `data` field carries the owner's entity id — vanilla's `Projectile.getAddEntityPacket`
@@ -79,9 +114,6 @@ impl SpawnEntityPacket {
     ) -> Self {
         let (x, y, z) = position.xyz();
         let (yaw, pitch) = rotation.yaw_pitch();
-        let fixed_point = |value: f32| -> i16 {
-            (f64::from(value) * 8000.0).clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
-        };
 
         Self {
             entity_id: VarInt::new(entity_id),
@@ -94,9 +126,9 @@ impl SpawnEntityPacket {
             yaw: NetAngle::from_degrees(f64::from(yaw)),
             head_yaw: NetAngle::from_degrees(f64::from(yaw)),
             data: VarInt::new(owner_entity_id),
-            velocity_x: fixed_point(velocity.x),
-            velocity_y: fixed_point(velocity.y),
-            velocity_z: fixed_point(velocity.z),
+            velocity_x: super::set_entity_motion::encode_velocity(velocity.x),
+            velocity_y: super::set_entity_motion::encode_velocity(velocity.y),
+            velocity_z: super::set_entity_motion::encode_velocity(velocity.z),
         }
     }
 

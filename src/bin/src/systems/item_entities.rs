@@ -7,9 +7,10 @@
 //! Movement, expiry and pickup run once per tick in [`tick_item_entities`], which costs one empty
 //! query when nothing has been dropped.
 //!
-//! Movement is deliberately simplified rather than vanilla-accurate: an item falls, bounces off the
-//! first solid block below, drifts when it is inside a fluid and despawns after its timer. Precise
-//! voxel collision is shared with the general entity physics once that lands.
+//! Movement follows vanilla `ItemEntity.tick`: gravity in air, buoyancy and drag in a fluid (chosen
+//! by a latched box scan, the way `Entity.updateFluidHeightAndDoFluidPushing` works), collision
+//! against solid blocks and a rest state on the first surface below. The client runs the same tick,
+//! so the server integrates it identically instead of fighting it with snap corrections.
 
 use bevy_ecs::prelude::{Commands, Entity, MessageWriter, Query, Res, With, Without};
 use bevy_math::DVec3;
@@ -30,13 +31,14 @@ use ferrumc_messages::entity_update::SendEntityUpdate;
 use ferrumc_net::connection::StreamWriter;
 use ferrumc_net::packets::outgoing::entity_metadata::{EntityMetadata, EntityMetadataPacket};
 use ferrumc_net::packets::outgoing::remove_entities::RemoveEntitiesPacket;
+use ferrumc_net::packets::outgoing::set_entity_motion::SetEntityMotionPacket;
 use ferrumc_net::packets::outgoing::spawn_entity::SpawnEntityPacket;
 use ferrumc_net::packets::outgoing::take_item_entity::TakeItemEntityPacket;
 use ferrumc_net_codec::net_types::var_int::VarInt;
 use ferrumc_state::GlobalStateResource;
 use ferrumc_world::block_state_id::BlockStateId;
 use ferrumc_world::dimension::Dimension;
-use ferrumc_world::fluid::is_fluid;
+use ferrumc_world::fluid::{fluid_state, is_fluid, FluidKind};
 use ferrumc_world::pos::BlockPos;
 use tracing::{debug, warn};
 
@@ -50,20 +52,53 @@ const PLAYER_HALF_WIDTH: f64 = 0.3;
 const PLAYER_HEIGHT: f64 = 1.8;
 /// How fast a thrown stack leaves the player, in blocks per tick.
 const THROW_SPEED: f64 = 0.3;
+/// The standing eye height of a player, in blocks (vanilla's standing-pose `getEyeHeight`).
+const PLAYER_EYE_HEIGHT: f64 = 1.62;
+/// How far below the eyes a player-thrown stack appears: vanilla `createItemStackToDrop` spawns it at `getEyeY() - 0.3`.
+const DROP_BELOW_EYE: f64 = 0.3;
+/// The upward bias of a player-thrown stack, in blocks per tick: vanilla adds `0.1F` to its y velocity.
+const THROW_UPWARD_BIAS: f64 = 0.1;
 /// How far past the player's box vanilla reaches for entities to collect, sideways.
 const PICKUP_REACH_XZ: f64 = 1.0;
 /// How far past the player's box vanilla reaches below and above.
 const PICKUP_REACH_Y: f64 = 0.5;
 /// The side of the cube an item entity's bounding box is, with its position at the bottom.
 const ITEM_WIDTH: f64 = 0.25;
-/// Gravity applied to a falling item, in blocks per tick per tick.
+/// Gravity applied to a falling item, in blocks per tick per tick (vanilla `getDefaultGravity`).
 const GRAVITY: f32 = 0.04;
-/// Upward acceleration applied while an item is inside a fluid, making it rise.
-const FLUID_LIFT: f32 = 0.02;
-/// Fraction of velocity a falling item keeps per tick.
+/// Fraction of velocity an item keeps per tick after the move (vanilla drags by 0.98 on every
+/// axis, in air and in fluid alike).
 const AIR_DRAG: f32 = 0.98;
-/// Fraction of velocity an item inside a fluid keeps per tick.
-const FLUID_DRAG: f32 = 0.6;
+/// Horizontal velocity multiplier while submerged in water: vanilla `setUnderwaterMovement` ->
+/// `setFluidMovement(0.99F)`.
+const WATER_DRAG: f32 = 0.99;
+/// Horizontal velocity multiplier while submerged in lava: vanilla `setUnderLavaMovement` ->
+/// `setFluidMovement(0.95F)`.
+const LAVA_DRAG: f32 = 0.95;
+/// Buoyancy added to the vertical velocity each tick while in a fluid, as long as the item is not
+/// already rising faster than vanilla's limit (`setFluidMovement`: `y < 0.06 ? +5.0E-4 : 0`).
+const FLUID_BUOYANCY: f32 = 0.0005;
+/// Rise speed above which the buoyancy stops applying (vanilla `vec3.y < 0.06F`).
+const FLUID_RISE_LIMIT: f32 = 0.06;
+/// Minimum fluid depth inside the item's box for the underwater branch to apply
+/// (vanilla `isInWater() && getFluidHeight(WATER) > 0.1`).
+const FLUID_BRANCH_MIN: f64 = 0.1;
+/// How strongly a water current pushes an item per tick (vanilla motionScale 0.014).
+const WATER_PUSH: f64 = 0.014;
+/// Lava current push in the Nether (ultraWarm dimension, vanilla 0.007) and everywhere else
+/// (vanilla 0.0023333333333333335).
+const LAVA_PUSH_NETHER: f64 = 0.007;
+const LAVA_PUSH: f64 = 0.002_333_333_333_333_333_5;
+/// The fluid scan deflates the item's box by this much (vanilla `getBoundingBox().deflate(0.001)`).
+const FLUID_SCAN_DEFLATE: f64 = 0.001;
+/// A nearly-still item still gets at least this much push from a current (vanilla's 0.0045
+/// fallback); the stillness test uses 0.003 per horizontal axis.
+const FLOW_MIN_PUSH: f64 = 0.0045;
+const FLOW_STILL_EPS: f64 = 0.003;
+/// Vanilla `Vec3.normalize` treats vectors shorter than this as zero.
+const NORMALIZE_EPS: f64 = 1.0e-4;
+/// Vanilla's water surface slope constant in the flow calculation (0.8888889F).
+const FLOW_SLOPE_CONST: f64 = 0.888_888_9;
 /// How far below an item's feet we look for the block it stands on.
 ///
 /// It has to be more than nothing: an item that is already resting on a block would see the air it
@@ -92,21 +127,29 @@ type ConnectionQuery<'a> = (Entity, &'a StreamWriter);
 
 /// Where and how fast a stack a player throws leaves their hand.
 ///
-/// Vanilla spawns the item at eye height and gives it a velocity of `0.3` along the view vector
-/// (`Player.drop` through `shootFromRotation`). Both the drop key and a click that throws an item
-/// out of a slot go through here so they cannot disagree about the direction.
+/// This is vanilla `Player.drop` -> `LivingEntity.createItemStackToDrop` with `randomizeMotion =
+/// false`: the stack appears at the player's own X/Z and `0.3` below eye height - no offset along
+/// the view vector, so it never spawns inside a block the player happens to face - and leaves with
+/// a velocity of `0.3` along the view vector plus a `0.1` upward bias and a small random kick.
+/// Both the drop key and a click that throws an item out of a slot go through here so they cannot
+/// disagree about the direction.
 pub fn thrown_stack_motion(position: &Position, rotation: &Rotation) -> (Position, Velocity) {
     let (x, y, z) = rotation.to_direction_vector();
 
     let drop_position = Position::new(
-        position.coords.x + f64::from(x) * 0.3,
-        position.coords.y + 1.0 + f64::from(y) * 0.3,
-        position.coords.z + f64::from(z) * 0.3,
+        position.coords.x,
+        position.coords.y + PLAYER_EYE_HEIGHT - DROP_BELOW_EYE,
+        position.coords.z,
     );
+
+    let angle = rand::random::<f64>() * std::f64::consts::TAU;
+    let kick = 0.02 * rand::random::<f64>();
     let velocity = Velocity::new(
-        f64::from(x) * THROW_SPEED,
-        f64::from(y) * THROW_SPEED,
-        f64::from(z) * THROW_SPEED,
+        f64::from(x) * THROW_SPEED + angle.cos() * kick,
+        f64::from(y) * THROW_SPEED
+            + THROW_UPWARD_BIAS
+            + (rand::random::<f64>() - rand::random::<f64>()) * 0.1,
+        f64::from(z) * THROW_SPEED + angle.sin() * kick,
     );
 
     (drop_position, velocity)
@@ -146,12 +189,16 @@ pub fn drop_item(
         .id();
 
     let rotation = Rotation::default();
-    let packet = SpawnEntityPacket::new(
+    // The spawn packet carries the initial velocity (vanilla `ClientboundAddEntityPacket` does the
+    // same): the client integrates the item's own fall from that velocity, so a zeroed one makes
+    // the client-side stack lag behind the server and jitter while in the air.
+    let packet = SpawnEntityPacket::item(
         identity.entity_id,
         identity.uuid.as_u128(),
         ITEM_ENTITY_TYPE,
         position,
         &rotation,
+        velocity,
     );
 
     for (_, conn) in conn_query.iter() {
@@ -160,6 +207,15 @@ pub fn drop_item(
         }
     }
     broadcast_item_metadata(conn_query, identity.entity_id, &item);
+
+    // Vanilla `ServerEntity.sendPairingData` also sends the motion packet when the entity starts
+    // being tracked, so the client's velocity matches from the very first tick.
+    let motion_packet = SetEntityMotionPacket::new(identity.entity_id, velocity);
+    for (_, conn) in conn_query.iter() {
+        if let Err(err) = conn.send_packet_ref(&motion_packet) {
+            warn!("Failed to broadcast item entity motion: {err:?}");
+        }
+    }
 
     debug!(
         "Spawned item entity {} at {:?} carrying {:?}",
@@ -236,7 +292,8 @@ pub fn tick_item_entities(
     mut update_writer: MessageWriter<SendEntityUpdate>,
 ) {
     let mut despawned: Vec<i32> = Vec::new();
-    let mut updated: Vec<Entity> = Vec::new();
+    // (entity, network id): the id is needed at write-out to skip entities removed this tick.
+    let mut updated: Vec<(Entity, i32)> = Vec::new();
 
     for (entity, identity, mut item, mut position, mut velocity, mut grounded) in items.iter_mut() {
         item.age = item.age.saturating_add(1);
@@ -260,16 +317,24 @@ pub fn tick_item_entities(
             continue;
         }
 
-        let in_fluid = is_fluid_at(&state, position.coords, item.dimension);
+        let dimension = item.dimension;
+        // Vanilla scans the fluid state at the start of the tick (`Entity.baseTick` ->
+        // `updateInWaterStateAndDoFluidPushing`) and the `ItemEntity.tick` branch reads it, so the
+        // scan runs before the movement and decides whether this tick has gravity or buoyancy.
+        // The same scan also pushes the item along a current.
+        let medium = update_fluid_state(&state, dimension, &position, &mut velocity);
         apply_movement(
             &state,
-            item.dimension,
+            dimension,
             &mut position,
             &mut velocity,
             &mut grounded,
-            in_fluid,
+            medium,
         );
-        updated.push(entity);
+        // `ItemEntity.tick` runs the fluid update a second time after moving, which is what
+        // carries the current's push into the next tick's move.
+        update_fluid_state(&state, dimension, &position, &mut velocity);
+        updated.push((entity, identity.entity_id));
 
         if item.is_protected() {
             continue;
@@ -335,7 +400,13 @@ pub fn tick_item_entities(
     // still borrowed by the loop.
     remove_despawned(&mut commands, &items, &despawned);
 
-    for entity in updated {
+    for (entity, entity_id) in updated {
+        // An entity removed this tick (picked up, merged into another stack, expired) is already
+        // gone from the clients' view thanks to RemoveEntities; a position update for it would
+        // only warn about a dead entity when the update system reads the message next tick.
+        if despawned.contains(&entity_id) {
+            continue;
+        }
         update_writer.write(SendEntityUpdate(entity));
     }
 }
@@ -535,19 +606,22 @@ fn remove_despawned(
 ///
 /// `surface_of` is the height the item would land on between two positions, read from the world.
 /// It is passed in rather than read here so the resting rule can be tested without a world: the
-/// surface is the only part of the fall that needs one.
+/// surface is the only part of the fall that needs one. `fluid` is the medium the latched fluid
+/// scan found the box in, the way vanilla `ItemEntity.tick` branches on `isInWater()`/`isInLava()`.
 fn fall_step(
     position: &mut Position,
     velocity: &mut Velocity,
     surface_of: impl Fn(DVec3, DVec3) -> f64,
-    in_fluid: bool,
+    fluid: Option<FluidKind>,
 ) -> bool {
-    if in_fluid {
-        velocity.vec.y = (velocity.vec.y + FLUID_LIFT).min(0.5);
-        velocity.vec *= FLUID_DRAG;
-    } else {
-        velocity.vec.y -= GRAVITY;
-        velocity.vec *= AIR_DRAG;
+    // Vanilla's order (`ItemEntity.tick`): the fluid branch or gravity, then the move, then the
+    // drag. The client runs the very same tick on the item, so moving before dragging keeps both
+    // simulations on the same trajectory and the server's position updates only confirm what the
+    // client integrated, instead of fighting it with a different integration order.
+    match fluid {
+        Some(FluidKind::Water) => fluid_movement(velocity, WATER_DRAG),
+        Some(FluidKind::Lava) => fluid_movement(velocity, LAVA_DRAG),
+        None => velocity.vec.y -= GRAVITY,
     }
 
     let next = position.coords + velocity.vec.as_dvec3();
@@ -556,41 +630,167 @@ fn fall_step(
     // the landing point would let the item tunnel through thin floors and then pop back up.
     let surface = surface_of(position.coords, next);
 
-    if velocity.vec.y <= 0.0 && next.y <= surface && !in_fluid {
+    if velocity.vec.y <= 0.0 && next.y <= surface {
         // Land on the surface but keep the horizontal motion: vanilla items slide to a stop.
+        // This also applies under water, where the scan passes through the fluid and finds the
+        // solid floor, exactly like vanilla's `move` colliding with it.
         position.coords = DVec3::new(next.x, surface, next.z);
         velocity.vec.y = 0.0;
         return true;
     }
 
     position.coords = next;
+    // Vanilla drags by 0.98 on every axis after the move, in air and in fluid alike (on the
+    // ground x/z would use the block's friction, but a landed item is handled by the rest rule).
+    velocity.vec *= AIR_DRAG;
     false
 }
 
-/// Applies one tick of gravity, drag and resting to a single item entity.
+/// Vanilla `ItemEntity.setFluidMovement`: damp the horizontal axes and add buoyancy while below
+/// the rise limit - and, unlike `applyGravity`, apply no gravity at all.
+fn fluid_movement(velocity: &mut Velocity, multiplier: f32) {
+    velocity.vec.x *= multiplier;
+    velocity.vec.z *= multiplier;
+    if velocity.vec.y < FLUID_RISE_LIMIT {
+        velocity.vec.y += FLUID_BUOYANCY;
+    }
+}
+
+/// Swept horizontal movement (X, then Z) with collision against solid blocks, the way vanilla
+/// `Entity.move` collides every axis: an axis whose box would cross a block is clamped to that
+/// block's face and its velocity is zeroed, while the other axis keeps sliding along the wall.
+///
+/// The sweep probes every block column the box passes through, not just the destination cell, so
+/// a fast or diagonal throw cannot skip over a one-block-thick wall.
+fn slide_step(position: &mut Position, velocity: &mut Velocity, solid_at: &impl Fn(DVec3) -> bool) {
+    const HALF: f64 = ITEM_WIDTH / 2.0;
+    // A box edge exactly on a block boundary only touches the neighbour, it does not overlap it.
+    const EPS: f64 = 1e-9;
+
+    let from = position.coords;
+    // Block rows the box overlaps on Y, the axis that does not move in this pass.
+    let y0 = from.y.floor() as i32;
+    let y1 = (from.y + ITEM_WIDTH - EPS).floor() as i32;
+
+    // --- X axis: the cross ranges are Y and Z at the current position ---
+    let z0 = (from.z - HALF).floor() as i32;
+    let z1 = (from.z + HALF - EPS).floor() as i32;
+
+    let step_x = f64::from(velocity.vec.x);
+    if step_x != 0.0 {
+        let target = from.x + step_x;
+        let lo = from.x.min(target) - HALF;
+        let hi = from.x.max(target) + HALF;
+        let mut hit_face: Option<f64> = None;
+        let mut bx = lo.floor() as i32;
+        let bx_end = (hi - EPS).floor() as i32;
+        while bx <= bx_end {
+            for by in y0..=y1 {
+                for bz in z0..=z1 {
+                    if solid_at(DVec3::new(bx as f64 + 0.5, by as f64 + 0.5, bz as f64 + 0.5)) {
+                        // Clamp to the nearest face in the direction of motion.
+                        let face = if step_x > 0.0 {
+                            bx as f64 - HALF
+                        } else {
+                            bx as f64 + 1.0 + HALF
+                        };
+                        hit_face = Some(match hit_face {
+                            Some(f) => {
+                                if step_x > 0.0 { f.min(face) } else { f.max(face) }
+                            }
+                            None => face,
+                        });
+                    }
+                }
+            }
+            bx += 1;
+        }
+        if let Some(face) = hit_face {
+            position.coords.x = face;
+            velocity.vec.x = 0.0;
+        } else {
+            position.coords.x = target;
+        }
+    }
+
+    // --- Z axis: the cross ranges are Y and the new X ---
+    let x0 = (position.coords.x - HALF).floor() as i32;
+    let x1 = (position.coords.x + HALF - EPS).floor() as i32;
+
+    let step_z = f64::from(velocity.vec.z);
+    if step_z != 0.0 {
+        let target = from.z + step_z;
+        let lo = from.z.min(target) - HALF;
+        let hi = from.z.max(target) + HALF;
+        let mut hit_face: Option<f64> = None;
+        let mut bz = lo.floor() as i32;
+        let bz_end = (hi - EPS).floor() as i32;
+        while bz <= bz_end {
+            for by in y0..=y1 {
+                for bx in x0..=x1 {
+                    if solid_at(DVec3::new(bx as f64 + 0.5, by as f64 + 0.5, bz as f64 + 0.5)) {
+                        let face = if step_z > 0.0 {
+                            bz as f64 - HALF
+                        } else {
+                            bz as f64 + 1.0 + HALF
+                        };
+                        hit_face = Some(match hit_face {
+                            Some(f) => {
+                                if step_z > 0.0 { f.min(face) } else { f.max(face) }
+                            }
+                            None => face,
+                        });
+                    }
+                }
+            }
+            bz += 1;
+        }
+        if let Some(face) = hit_face {
+            position.coords.z = face;
+            velocity.vec.z = 0.0;
+        } else {
+            position.coords.z = target;
+        }
+    }
+}
+
+/// Applies one tick of gravity (or buoyancy), horizontal collision, drag and resting to a single
+/// item entity. `fluid` is the medium the latched fluid scan found the item in.
 fn apply_movement(
     state: &GlobalStateResource,
     dimension: Dimension,
     position: &mut Position,
     velocity: &mut Velocity,
     grounded: &mut OnGround,
-    in_fluid: bool,
+    fluid: Option<FluidKind>,
 ) {
-    let surface_of = |from: DVec3, to: DVec3| surface_height(state, from, to, dimension.as_str(), in_fluid);
+    let dimension_str = dimension.as_str();
+    let solid_at = |point: DVec3| {
+        block_at(state, (point.x, point.y, point.z), dimension_str)
+            .is_some_and(|block| is_solid(&block))
+    };
 
-    if fall_step(position, velocity, surface_of, in_fluid) {
+    // Vanilla `Entity.move` collides on every axis; the horizontal ones are swept here so a
+    // diagonal throw is stopped by a wall instead of tunneling through it.
+    slide_step(position, velocity, &solid_at);
+
+    let surface_of = |from: DVec3, to: DVec3| surface_height(state, from, to, dimension_str);
+
+    if fall_step(position, velocity, surface_of, fluid) {
         // Resting sheds most of the sideways drift, the way hitting the ground slows an item down.
         velocity.vec.x *= 0.5;
         velocity.vec.z *= 0.5;
         grounded.0 = true;
     } else {
-        grounded.0 = in_fluid;
+        // Vanilla `onGround` only comes from colliding with a solid block, never from a fluid.
+        grounded.0 = false;
     }
 }
 
 /// The height an item comes to rest on: the top of the highest solid block in the column between
 /// `from` and `to`, so a fast fall is stopped by the first surface it crosses instead of sinking
-/// past it.
+/// past it. Fluids are not solid, so the scan passes through water to the floor underneath, the
+/// way vanilla's `move` collides with the floor but not with the fluid.
 ///
 /// The top of the block, not the item's own floored height. It has to be the block's top because
 /// the caller compares it against where the item is about to be: returning the item's floored
@@ -601,12 +801,7 @@ fn surface_height(
     from: DVec3,
     to: DVec3,
     dimension: &str,
-    in_fluid: bool,
 ) -> f64 {
-    if in_fluid {
-        return f64::from(MIN_WORLD_Y);
-    }
-
     // Scan from just under the item's feet (far enough down that an item already resting on a
     // block still sees that block, rather than the air it stands in) down to the landing cell.
     let top_y = (from.y - REST_OFFSET).floor();
@@ -681,9 +876,275 @@ pub(crate) fn is_fluid_at(
     .unwrap_or(false)
 }
 
+/// One cell of the fluid scan: a fluid block inside the item's box, with the height and the flow
+/// vanilla would compute for it.
+struct FluidCell {
+    kind: FluidKind,
+    /// Vanilla `FluidState.getHeight`: 1.0 when the same fluid sits directly above, else the
+    /// fluid's own height (`amount / 9`).
+    height: f64,
+    /// Vanilla `FluidState.getFlow`: the current's direction at this cell (unit vector, or zero
+    /// in still fluid).
+    flow: DVec3,
+}
+
+/// The medium vanilla `ItemEntity.tick` branches on: water when the box is more than 0.1 deep in
+/// it, else lava, else air (gravity). The 0.1 threshold is what makes an item bobbing at the
+/// surface switch smoothly between the two branches instead of flip-flopping every tick.
+fn branch_medium(touching_water: bool, water_height: f64, lava_height: f64) -> Option<FluidKind> {
+    if touching_water && water_height > FLUID_BRANCH_MIN {
+        Some(FluidKind::Water)
+    } else if lava_height > FLUID_BRANCH_MIN {
+        Some(FluidKind::Lava)
+    } else {
+        None
+    }
+}
+
+/// Vanilla `Entity.updateInWaterStateAndDoFluidPushing` for one item: scans the box (deflated by
+/// 0.001) for water and lava, records how deep the box is in each, and adds the currents' push to
+/// the velocity. Returns the medium the movement branch has to use.
+///
+/// Vanilla runs this at the start of the tick (`Entity.baseTick`) and again at the end
+/// (`ItemEntity.tick`), so the caller runs it twice as well.
+fn update_fluid_state(
+    state: &GlobalStateResource,
+    dimension: Dimension,
+    position: &Position,
+    velocity: &mut Velocity,
+) -> Option<FluidKind> {
+    let dimension_str = dimension.as_str();
+    let half = ITEM_WIDTH / 2.0;
+    let deflate = FLUID_SCAN_DEFLATE;
+    let min = DVec3::new(
+        position.coords.x - half + deflate,
+        position.coords.y + deflate,
+        position.coords.z - half + deflate,
+    );
+    let max = DVec3::new(
+        position.coords.x + half - deflate,
+        position.coords.y + ITEM_WIDTH - deflate,
+        position.coords.z + half - deflate,
+    );
+    let scan_box = ScanBox {
+        min_y: min.y,
+        x0: min.x.floor() as i32,
+        x1: max.x.ceil() as i32,
+        y0: min.y.floor() as i32,
+        y1: max.y.ceil() as i32,
+        z0: min.z.floor() as i32,
+        z1: max.z.ceil() as i32,
+    };
+
+    let cell_at = |pos: (i32, i32, i32)| fluid_cell_at(state, dimension_str, pos);
+
+    let (touching_water, water_height) =
+        scan_fluid_kind(&scan_box, FluidKind::Water, WATER_PUSH, velocity, &cell_at);
+    // Vanilla picks the lava motion scale from the dimension's `ultraWarm` flag.
+    let lava_push = if dimension == Dimension::Nether {
+        LAVA_PUSH_NETHER
+    } else {
+        LAVA_PUSH
+    };
+    let (_, lava_height) = scan_fluid_kind(&scan_box, FluidKind::Lava, lava_push, velocity, &cell_at);
+
+    branch_medium(touching_water, water_height, lava_height)
+}
+
+/// The deflated item box as block-cell ranges, the way vanilla iterates an `AABB` in
+/// `updateFluidHeightAndDoFluidPushing` (`floor(min)` .. `ceil(max)` on each axis).
+struct ScanBox {
+    min_y: f64,
+    x0: i32,
+    x1: i32,
+    y0: i32,
+    y1: i32,
+    z0: i32,
+    z1: i32,
+}
+
+/// Vanilla `Entity.updateFluidHeightAndDoFluidPushing(tag, motionScale)`: one pass over the box
+/// for a single fluid kind. Returns `(any cell touched, max depth of the box in that fluid)`.
+///
+/// The cell lookup is a closure so the scan can be tested without a world.
+fn scan_fluid_kind(
+    scan_box: &ScanBox,
+    kind: FluidKind,
+    motion_scale: f64,
+    velocity: &mut Velocity,
+    cell_at: &impl Fn((i32, i32, i32)) -> Option<FluidCell>,
+) -> (bool, f64) {
+    let mut depth = 0.0;
+    let mut touching = false;
+    let mut flow_sum = DVec3::ZERO;
+    let mut cells = 0;
+
+    for x in scan_box.x0..scan_box.x1 {
+        for y in scan_box.y0..scan_box.y1 {
+            for z in scan_box.z0..scan_box.z1 {
+                let Some(cell) = cell_at((x, y, z)) else {
+                    continue;
+                };
+                if cell.kind != kind {
+                    continue;
+                }
+                let surface = y as f64 + cell.height;
+                if surface >= scan_box.min_y {
+                    touching = true;
+                    depth = (surface - scan_box.min_y).max(depth);
+                    // `isPushedByFluid()` is true for items, so the current pushes; shallower
+                    // than 0.4, the push scales down with the depth.
+                    let mut flow = cell.flow;
+                    if depth < 0.4 {
+                        flow *= depth;
+                    }
+                    flow_sum += flow;
+                    cells += 1;
+                }
+            }
+        }
+    }
+
+    if flow_sum.length() > 0.0 {
+        // `cells` is at least one here: a non-zero sum needs at least one contribution.
+        let mut push = flow_sum / cells as f64;
+        // Items are not players, so vanilla always normalizes the summed flow.
+        push = normalize(push);
+        push *= motion_scale;
+        let vel = velocity.vec.as_dvec3();
+        if vel.x.abs() < FLOW_STILL_EPS
+            && vel.z.abs() < FLOW_STILL_EPS
+            && push.length() < FLOW_MIN_PUSH
+        {
+            push = normalize(push) * FLOW_MIN_PUSH;
+        }
+        velocity.vec += push.as_vec3a();
+    }
+
+    (touching, depth)
+}
+
+/// Reads one cell of the world as a fluid: its kind, its height (vanilla `FluidState.getHeight`)
+/// and its flow vector (vanilla `FluidState.getFlow`).
+fn fluid_cell_at(
+    state: &GlobalStateResource,
+    dimension: &str,
+    (x, y, z): (i32, i32, i32),
+) -> Option<FluidCell> {
+    let block = block_at(state, (x as f64, y as f64, z as f64), dimension)?;
+    let fluid = fluid_state(block)?;
+    let own = own_fluid_height(fluid.level);
+    let same_above = block_at(state, (x as f64, (y + 1) as f64, z as f64), dimension)
+        .and_then(fluid_state)
+        .is_some_and(|above| above.kind == fluid.kind);
+    let height = if same_above { 1.0 } else { own };
+    let flow = fluid_flow(state, dimension, (x, y, z), fluid.kind, fluid.level, own);
+    Some(FluidCell {
+        kind: fluid.kind,
+        height,
+        flow,
+    })
+}
+
+/// Vanilla `FlowingFluid.getOwnHeight`: `amount / 9`, where a source (block level 0) counts as 8
+/// and falling block levels 8..=15 map back to fluid levels 1..=8.
+fn own_fluid_height(block_level: u8) -> f64 {
+    let amount = match block_level {
+        0 => 8,
+        level if level >= 8 => level - 7,
+        level => level,
+    };
+    f64::from(amount) / 9.0
+}
+
+/// Vanilla `FlowingFluid.getFlow`: the direction the fluid at `pos` flows, from the height
+/// difference with its four horizontal neighbours. A unit vector, or zero in still fluid.
+fn fluid_flow(
+    state: &GlobalStateResource,
+    dimension: &str,
+    (x, y, z): (i32, i32, i32),
+    kind: FluidKind,
+    block_level: u8,
+    own_height: f64,
+) -> DVec3 {
+    // `Direction.Plane.HORIZONTAL`: north, east, south, west.
+    const HORIZONTAL: [(i32, i32); 4] = [(0, -1), (1, 0), (0, 1), (-1, 0)];
+    let fluid_at = |(x, y, z): (i32, i32, i32)| {
+        block_at(state, (x as f64, y as f64, z as f64), dimension).and_then(fluid_state)
+    };
+
+    let mut flow_x = 0.0;
+    let mut flow_z = 0.0;
+    for (dx, dz) in HORIZONTAL {
+        let neighbour = fluid_at((x + dx, y, z + dz));
+        // `affectsFlow`: the neighbour cell is empty or holds the same fluid.
+        if !neighbour.is_none_or(|n| n.kind == kind) {
+            continue;
+        }
+        let mut n_height = neighbour.map_or(0.0, |n| own_fluid_height(n.level));
+        let mut diff = 0.0;
+        if n_height == 0.0 {
+            // The neighbour cell is empty: the flow still spreads if the fluid continues below
+            // it and the block in the neighbour cell does not block motion.
+            let blocks_motion = block_at(state, ((x + dx) as f64, y as f64, (z + dz) as f64), dimension)
+                .is_some_and(|block| is_solid(&block));
+            if !blocks_motion {
+                if let Some(below) = fluid_at((x + dx, y - 1, z + dz)).filter(|b| b.kind == kind) {
+                    let below_height = own_fluid_height(below.level);
+                    if below_height > 0.0 {
+                        n_height = below_height;
+                        diff = own_height - (n_height - FLOW_SLOPE_CONST);
+                    }
+                }
+            }
+        } else if n_height > 0.0 {
+            diff = own_height - n_height;
+        }
+        if diff != 0.0 {
+            flow_x += f64::from(dx) * diff;
+            flow_z += f64::from(dz) * diff;
+        }
+    }
+
+    let mut flow = DVec3::new(flow_x, 0.0, flow_z);
+    if block_level >= 8 {
+        // FALLING: next to a solid face the flow dives straight down.
+        for (dx, dz) in HORIZONTAL {
+            if is_solid_face(state, dimension, (x + dx, y, z + dz), kind)
+                || is_solid_face(state, dimension, (x + dx, y + 1, z + dz), kind)
+            {
+                flow = normalize(flow) + DVec3::new(0.0, -6.0, 0.0);
+                break;
+            }
+        }
+    }
+    normalize(flow)
+}
+
+/// Vanilla `FlowingFluid.isSolidFace` for a horizontal side, approximated with the block's
+/// collision shape: the neighbour is not the same fluid and blocks motion.
+fn is_solid_face(
+    state: &GlobalStateResource,
+    dimension: &str,
+    (x, y, z): (i32, i32, i32),
+    kind: FluidKind,
+) -> bool {
+    match block_at(state, (x as f64, y as f64, z as f64), dimension) {
+        Some(block) => !fluid_state(block).is_some_and(|f| f.kind == kind) && is_solid(&block),
+        None => false,
+    }
+}
+
+/// Vanilla `Vec3.normalize`: vectors shorter than 1e-4 normalize to zero instead of NaN.
+fn normalize(v: DVec3) -> DVec3 {
+    let len = v.length();
+    if len < NORMALIZE_EPS { DVec3::ZERO } else { v / len }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy_math::Vec3A;
 
     #[test]
     fn air_is_not_solid() {
@@ -735,7 +1196,7 @@ mod tests {
         let mut position = Position::new(0.5, surface + 0.25, 0.5);
         let mut velocity = Velocity::new(0.0, 0.2, 0.0);
         for _ in 0..100 {
-            if fall_step(&mut position, &mut velocity, |_from, _to| surface, false) {
+            if fall_step(&mut position, &mut velocity, |_from, _to| surface, None) {
                 return position;
             }
         }
@@ -761,13 +1222,112 @@ mod tests {
         let mut velocity = Velocity::zero();
 
         for tick in 0..20 {
-            let still_resting = fall_step(&mut resting, &mut velocity, |_from, _to| 64.0, false);
+            let still_resting = fall_step(&mut resting, &mut velocity, |_from, _to| 64.0, None);
             assert!(
                 still_resting,
                 "the item must keep resting on the surface, not drift down (tick {tick})"
             );
             assert_eq!(resting.coords.y, 64.0, "the item sank on tick {tick}");
         }
+    }
+
+    #[test]
+    fn a_player_thrown_stack_spawns_below_eye_height_without_look_offset() {
+        // Vanilla `LivingEntity.createItemStackToDrop` spawns a player-thrown stack at
+        // `(getX(), getEyeY() - 0.3, getZ())` - no offset along the view vector - with a velocity
+        // of `0.3` along it plus a `0.1` upward bias and a small random kick.
+        let position = Position::new(10.0, 64.0, -3.0);
+        let rotation = Rotation::new(45.0, 0.0);
+
+        let (drop_position, velocity) = thrown_stack_motion(&position, &rotation);
+
+        assert_eq!(drop_position.coords.x, 10.0);
+        assert_eq!(drop_position.coords.z, -3.0);
+        assert!((drop_position.coords.y - (64.0 + PLAYER_EYE_HEIGHT - DROP_BELOW_EYE)).abs() < 1e-9);
+
+        let (dir_x, dir_y, dir_z) = rotation.to_direction_vector();
+        assert!((f64::from(velocity.vec.x) - f64::from(dir_x) * THROW_SPEED).abs() <= 0.02 + 1e-6);
+        assert!((f64::from(velocity.vec.z) - f64::from(dir_z) * THROW_SPEED).abs() <= 0.02 + 1e-6);
+        let vy = f64::from(velocity.vec.y);
+        let base_vy = f64::from(dir_y) * THROW_SPEED + THROW_UPWARD_BIAS;
+        assert!(
+            (base_vy - 0.1 - 1e-6..=base_vy + 0.1 + 1e-6).contains(&vy),
+            "thrown vy {vy} must be the view-vector throw plus the 0.1 bias plus at most 0.1 of noise"
+        );
+    }
+
+    #[test]
+    fn gravity_moves_the_item_before_the_drag_is_applied() {
+        // Vanilla `ItemEntity.tick` order: `applyGravity` -> `move` -> drag. A tick from rest must
+        // move the item by exactly the post-gravity velocity, and only then scale the velocity.
+        let mut position = Position::new(0.5, 70.0, 0.5);
+        let mut velocity = Velocity::zero();
+        let no_surface = |_from: DVec3, _to: DVec3| f64::from(MIN_WORLD_Y);
+
+        let landed = fall_step(&mut position, &mut velocity, no_surface, None);
+
+        assert!(!landed);
+        assert!((position.coords.y - (70.0 - f64::from(GRAVITY))).abs() < 1e-6);
+        assert!(
+            (f64::from(velocity.vec.y) + f64::from(GRAVITY) * f64::from(AIR_DRAG)).abs() < 1e-6
+        );
+    }
+
+    #[test]
+    fn a_throw_is_stopped_by_a_wall_even_when_the_step_lands_past_it() {
+        // A one-block-thick wall at column x = 5. The step of 2.0 from x = 4.0 would end at
+        // x = 6.0, whose box no longer overlaps the wall: only a swept check catches it.
+        let wall = |p: DVec3| p.x.floor() == 5.0;
+        let mut position = Position::new(4.0, 70.0, 0.5);
+        let mut velocity = Velocity::new(2.0, 0.0, 0.0);
+
+        slide_step(&mut position, &mut velocity, &wall);
+
+        assert_eq!(position.coords.x, 5.0 - ITEM_WIDTH / 2.0);
+        assert_eq!(velocity.vec.x, 0.0);
+        assert_eq!(position.coords.z, 0.5);
+    }
+
+    #[test]
+    fn a_throw_into_a_wall_slides_along_it_on_the_other_axis() {
+        // Same wall at column x = 5, thrown diagonally: X is clamped to the face, Z still moves.
+        let wall = |p: DVec3| p.x.floor() == 5.0;
+        let mut position = Position::new(4.0, 70.0, 0.5);
+        let mut velocity = Velocity::new(2.0, 0.0, 0.3);
+
+        slide_step(&mut position, &mut velocity, &wall);
+
+        assert_eq!(position.coords.x, 5.0 - ITEM_WIDTH / 2.0);
+        assert_eq!(velocity.vec.x, 0.0);
+        assert!((position.coords.z - 0.8).abs() < 1e-6);
+        assert_eq!(velocity.vec.z, 0.3);
+    }
+
+    #[test]
+    fn a_throw_against_a_wall_clamps_to_its_near_face_when_moving_negative() {
+        // Wall at columns x <= 2, thrown in -X: the box stops at the wall's +X face.
+        let wall = |p: DVec3| p.x.floor() <= 2.0;
+        let mut position = Position::new(3.0, 70.0, 0.5);
+        let mut velocity = Velocity::new(-2.0, 0.0, 0.0);
+
+        slide_step(&mut position, &mut velocity, &wall);
+
+        assert_eq!(position.coords.x, 3.0 + ITEM_WIDTH / 2.0);
+        assert_eq!(velocity.vec.x, 0.0);
+    }
+
+    #[test]
+    fn a_throw_with_no_wall_moves_the_full_step() {
+        let open = |_p: DVec3| false;
+        let mut position = Position::new(4.0, 70.0, 0.5);
+        let mut velocity = Velocity::new(0.3, 0.0, -0.2);
+
+        slide_step(&mut position, &mut velocity, &open);
+
+        assert!((position.coords.x - 4.3).abs() < 1e-6);
+        assert!((position.coords.z - 0.3).abs() < 1e-6);
+        assert_eq!(velocity.vec.x, 0.3);
+        assert_eq!(velocity.vec.z, -0.2);
     }
 
     #[test]
@@ -785,7 +1345,7 @@ mod tests {
             }
         };
 
-        let resting = fall_step(&mut position, &mut velocity, surface_of, false);
+        let resting = fall_step(&mut position, &mut velocity, surface_of, None);
 
         assert!(resting, "the item must land on the surface it crossed");
         assert_eq!(position.coords.y, 64.0);
@@ -883,5 +1443,177 @@ mod tests {
         let item = DVec3::new(0.5, 66.5, 0.5);
 
         assert!(!reaches_pickup_range(item, player));
+    }
+
+    #[test]
+    fn water_applies_buoyancy_and_drag_but_no_gravity() {
+        // Vanilla `setFluidMovement(0.99)`: x/z *= 0.99, y += 0.0005 while y < 0.06, no gravity;
+        // after the move the drag is 0.98 on every axis.
+        let mut position = Position::new(0.5, 70.0, 0.5);
+        let mut velocity = Velocity::new(0.3, -0.5, 0.0);
+        let no_surface = |_from: DVec3, _to: DVec3| f64::from(MIN_WORLD_Y);
+
+        let landed = fall_step(&mut position, &mut velocity, no_surface, Some(FluidKind::Water));
+
+        assert!(!landed);
+        let expected_vy = (-0.5 + f64::from(FLUID_BUOYANCY)) * f64::from(AIR_DRAG);
+        assert!(
+            (f64::from(velocity.vec.y) - expected_vy).abs() < 1e-6,
+            "vy must be (vy + buoyancy) * 0.98, not vy - gravity: {} vs {expected_vy}",
+            f64::from(velocity.vec.y)
+        );
+        let expected_vx = 0.3 * f64::from(WATER_DRAG) * f64::from(AIR_DRAG);
+        assert!((f64::from(velocity.vec.x) - expected_vx).abs() < 1e-6);
+        assert!((position.coords.y - (70.0 + (-0.5 + f64::from(FLUID_BUOYANCY)))).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_item_bobbing_at_the_surface_keeps_the_water_branch() {
+        // The old bug: the feet-block check flipped at the surface and gravity came back for a
+        // tick. Vanilla latches the box scan, so an item less than 0.1 deep still counts as in
+        // water for the branch as long as `wasTouchingWater` is set - here it rises at 0.05.
+        let mut position = Position::new(0.5, 64.8, 0.5);
+        let mut velocity = Velocity::new(0.1, 0.05, 0.0);
+        let no_surface = |_from: DVec3, _to: DVec3| f64::from(MIN_WORLD_Y);
+
+        let landed = fall_step(&mut position, &mut velocity, no_surface, Some(FluidKind::Water));
+
+        assert!(!landed, "a rising item must not land on the water surface");
+        // 0.05 < 0.06, so buoyancy applies: (0.05 + 0.0005) * 0.98, and never 0.05 - 0.04.
+        let expected_vy = (0.05 + f64::from(FLUID_BUOYANCY)) * f64::from(AIR_DRAG);
+        assert!((f64::from(velocity.vec.y) - expected_vy).abs() < 1e-6);
+        assert!(f64::from(velocity.vec.y) > 0.0);
+    }
+
+    #[test]
+    fn buoyancy_stops_above_the_rise_limit() {
+        // Vanilla adds 5.0E-4 only while y < 0.06; above that the water branch adds nothing.
+        let mut position = Position::new(0.5, 70.0, 0.5);
+        let mut velocity = Velocity::new(0.0, 0.1, 0.0);
+        let no_surface = |_from: DVec3, _to: DVec3| f64::from(MIN_WORLD_Y);
+
+        fall_step(&mut position, &mut velocity, no_surface, Some(FluidKind::Water));
+
+        let expected_vy = 0.1 * f64::from(AIR_DRAG);
+        assert!((f64::from(velocity.vec.y) - expected_vy).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lava_uses_the_0_95_multiplier() {
+        let mut position = Position::new(0.5, 70.0, 0.5);
+        let mut velocity = Velocity::new(0.2, -0.1, 0.0);
+        let no_surface = |_from: DVec3, _to: DVec3| f64::from(MIN_WORLD_Y);
+
+        fall_step(&mut position, &mut velocity, no_surface, Some(FluidKind::Lava));
+
+        let expected_vy = (-0.1 + f64::from(FLUID_BUOYANCY)) * f64::from(AIR_DRAG);
+        let expected_vx = 0.2 * f64::from(LAVA_DRAG) * f64::from(AIR_DRAG);
+        assert!((f64::from(velocity.vec.y) - expected_vy).abs() < 1e-6);
+        assert!((f64::from(velocity.vec.x) - expected_vx).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_item_lands_on_the_floor_under_water() {
+        // The scan passes through the fluid and finds the solid floor, so a sinking item rests
+        // on it instead of falling through the lake bed (vanilla `move` collides the same way).
+        let mut position = Position::new(0.5, 64.3, 0.5);
+        let mut velocity = Velocity::new(0.0, -0.5, 0.0);
+        let floor = |_from: DVec3, _to: DVec3| 64.0;
+
+        let landed = fall_step(&mut position, &mut velocity, floor, Some(FluidKind::Water));
+
+        assert!(landed);
+        assert_eq!(position.coords.y, 64.0);
+        assert_eq!(velocity.vec.y, 0.0);
+    }
+
+    #[test]
+    fn the_branch_needs_more_than_a_tenth_of_fluid_depth() {
+        // Vanilla: `isInWater() && getFluidHeight(WATER) > 0.1`. A box barely touching the
+        // surface (<= 0.1) falls back to gravity, which is what settles the surface bob.
+        assert_eq!(branch_medium(true, 0.5, 0.0), Some(FluidKind::Water));
+        assert_eq!(branch_medium(true, 0.1, 0.0), None);
+        assert_eq!(branch_medium(true, 0.05, 0.0), None);
+        assert_eq!(branch_medium(false, 0.0, 0.5), Some(FluidKind::Lava));
+        assert_eq!(branch_medium(false, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn the_fluid_scan_measures_the_box_depth() {
+        // A box whose feet are at 64.2 overlapping a full water cell at y = 64 (surface 65.0)
+        // is 0.8 deep in water.
+        let water_cell = |(x, y, z): (i32, i32, i32)| {
+            if (x, y, z) == (0, 64, 0) {
+                Some(FluidCell {
+                    kind: FluidKind::Water,
+                    height: 1.0,
+                    flow: DVec3::ZERO,
+                })
+            } else {
+                None
+            }
+        };
+        let mut velocity = Velocity::zero();
+        let scan_box = ScanBox {
+            min_y: 64.2,
+            x0: 0,
+            x1: 1,
+            y0: 64,
+            y1: 65,
+            z0: 0,
+            z1: 1,
+        };
+
+        let (touching, depth) = scan_fluid_kind(
+            &scan_box,
+            FluidKind::Water,
+            WATER_PUSH,
+            &mut velocity,
+            &water_cell,
+        );
+
+        assert!(touching);
+        assert!((depth - 0.8).abs() < 1e-9);
+        // Still water (zero flow) pushes nothing.
+        assert_eq!(velocity.vec, Vec3A::ZERO);
+    }
+
+    #[test]
+    fn a_current_pushes_a_still_item() {
+        // One cell with a unit flow in +X: the sum normalizes to +X and scales by the motion
+        // scale (0.014 for water), which is above the 0.0045 stillness fallback.
+        let cell = |_: (i32, i32, i32)| {
+            Some(FluidCell {
+                kind: FluidKind::Water,
+                height: 1.0,
+                flow: DVec3::new(1.0, 0.0, 0.0),
+            })
+        };
+        let mut velocity = Velocity::zero();
+        let scan_box = ScanBox {
+            min_y: 64.0,
+            x0: 0,
+            x1: 1,
+            y0: 64,
+            y1: 65,
+            z0: 0,
+            z1: 1,
+        };
+
+        scan_fluid_kind(&scan_box, FluidKind::Water, WATER_PUSH, &mut velocity, &cell);
+
+        assert!((f64::from(velocity.vec.x) - WATER_PUSH).abs() < 1e-6);
+        assert_eq!(velocity.vec.y, 0.0);
+        assert_eq!(velocity.vec.z, 0.0);
+    }
+
+    #[test]
+    fn own_fluid_height_matches_vanilla_amounts() {
+        // Source = 8/9; flowing levels are level/9; falling block levels 8..=15 map to 1..=8.
+        assert!((own_fluid_height(0) - 8.0 / 9.0).abs() < 1e-9);
+        assert!((own_fluid_height(1) - 1.0 / 9.0).abs() < 1e-9);
+        assert!((own_fluid_height(7) - 7.0 / 9.0).abs() < 1e-9);
+        assert!((own_fluid_height(8) - 1.0 / 9.0).abs() < 1e-9);
+        assert!((own_fluid_height(15) - 8.0 / 9.0).abs() < 1e-9);
     }
 }

@@ -151,6 +151,20 @@ pub mod constructors {
                 EntityMetadataValue::Entity8(item),
             )
         }
+
+        /// The player model customisation byte (metadata index 17 on player entities).
+        ///
+        /// Bit 0x01 is the cape (`PlayerModelPart.CAPE`), 0x02 jacket, 0x04 left sleeve,
+        /// 0x08 right sleeve, 0x10 left pants leg, 0x20 right pants leg, 0x40 hat. Vanilla
+        /// defaults this byte to 0, so unless the server sends it no cape (or second skin
+        /// layer) is rendered at all. The value is exactly the `displayedSkinParts` byte the
+        /// client reported in its client information.
+        pub fn player_model_customisation(parts: u8) -> Self {
+            Self::new(
+                EntityMetadataIndexType::Byte,
+                EntityMetadataValue::Entity17(parts),
+            )
+        }
     }
 }
 
@@ -219,6 +233,7 @@ mod value {
         Entity0(EntityStateMask),
         Entity6(EntityPose),
         Entity8(InventorySlot),
+        Entity17(u8),
     }
 
     impl EntityMetadataValue {
@@ -228,6 +243,8 @@ mod value {
                 Entity0(_) => 0,
                 Entity6(_) => 6,
                 Entity8(_) => 8,
+                // Player model customisation (skin parts incl. the cape bit), BYTE serializer.
+                Entity17(_) => 17,
             }
         }
     }
@@ -369,5 +386,29 @@ mod extra_data_types {
         ) -> Result<(), NetEncodeError> {
             self.index().encode_async(writer, opts).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrumc_macros::lookup_packet;
+
+    #[test]
+    fn player_model_customisation_encodes_as_index_17_byte() {
+        let packet = EntityMetadataPacket::new(
+            VarInt::new(5),
+            [EntityMetadata::player_model_customisation(0x7F)],
+        );
+
+        let mut buf = Vec::new();
+        packet
+            .encode(&mut buf, &NetEncodeOpts::None)
+            .expect("the packet encodes");
+
+        let packet_id = lookup_packet!("play", "clientbound", "set_entity_data") as u8;
+
+        // packet id, entity id (varint 5), index 17, serializer BYTE (0), value 0x7F, terminator
+        assert_eq!(buf, vec![packet_id, 0x05, 0x11, 0x00, 0x7F, 0xFF]);
     }
 }

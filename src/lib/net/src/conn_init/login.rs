@@ -1,4 +1,4 @@
-use crate::auth::authenticate_user;
+use crate::auth::{authenticate_user, fetch_profile_properties};
 use crate::compression::compress_packet;
 use crate::conn_init::VarInt;
 use crate::conn_init::{LoginResult, NetDecodeOpts};
@@ -127,7 +127,7 @@ async fn setup_encryption_and_auth(
     compressed: bool,
 ) -> Result<(String, Uuid, Vec<PlayerProperty>), NetError> {
     if !config.encryption_enabled && !config.online_mode {
-        return Ok(offline_identity(login_start));
+        return Ok(with_profile_textures(offline_identity(login_start)).await);
     }
 
     // Generate verify token
@@ -191,22 +191,56 @@ async fn setup_encryption_and_auth(
             ));
         }
 
-        return Ok((username, uuid, properties));
+        return Ok(with_profile_textures((username, uuid, properties)).await);
     }
 
-    Ok(offline_identity(login_start))
+    Ok(with_profile_textures(offline_identity(login_start)).await)
 }
 
 /// The identity of a player that joined without being authenticated by Mojang.
 ///
-/// The name and the UUID are the ones the client sent, and the player carries no profile
-/// properties, so the client draws them with a default skin.
+/// The name and the UUID are the ones the client sent, and the player starts out with no
+/// profile properties.
 fn offline_identity(login_start: &LoginStartPacket) -> (String, Uuid, Vec<PlayerProperty>) {
     (
         login_start.username.clone(),
         Uuid::from_u128(login_start.uuid),
         Vec::new(),
     )
+}
+
+/// Makes sure the identity carries the player's signed `textures` property.
+///
+/// The client only renders a cape (or non-default skin) for a player when the `textures`
+/// property forwarded in the player info is signed by Mojang, so the property has to come
+/// from Mojang itself. Players authenticated through the session server handshake already
+/// carry it; for everyone else (offline-mode logins) the profile is looked up by username, so
+/// a premium account still gets its own skin and cape. A failed or empty lookup never
+/// rejects the login — the player just keeps no properties and gets a default skin.
+async fn with_profile_textures(
+    identity: (String, Uuid, Vec<PlayerProperty>),
+) -> (String, Uuid, Vec<PlayerProperty>) {
+    let (username, uuid, properties) = identity;
+
+    if properties.iter().any(|property| property.name == "textures") {
+        return (username, uuid, properties);
+    }
+
+    match fetch_profile_properties(&username).await {
+        Ok(Some(fetched)) => {
+            debug!(
+                "Loaded Mojang profile properties for {} ({} properties)",
+                username,
+                fetched.len()
+            );
+            (username, uuid, fetched)
+        }
+        Ok(None) => (username, uuid, properties),
+        Err(err) => {
+            debug!("Could not fetch Mojang profile for {}: {:?}", username, err);
+            (username, uuid, properties)
+        }
+    }
 }
 
 /// Sends Login Success packet and waits for client acknowledgement.

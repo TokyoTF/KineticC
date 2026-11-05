@@ -35,6 +35,7 @@ pub mod player_info_update;
 // --------- Movement ----------
 pub mod entity_position_sync;
 pub mod player_abilities;
+pub mod set_entity_motion;
 pub mod set_head_rotation;
 pub mod update_entity_position;
 pub mod update_entity_position_and_rotation;
